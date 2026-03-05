@@ -103,7 +103,35 @@ def draw_grid_on_image(img: Image.Image, grid: np.ndarray,
     return out
 
 
+def zoom_crop(img: Image.Image, cx: int, cy: int, zoom: int) -> tuple:
+    """
+    Vrátí (oříznutý+zvětšený obrázek, offset_x, offset_y).
+    Při zoom=100 vrátí původní obrázek (bez ořezu).
+    Při zoom>100 ořízne oblast kolem (cx,cy) a zvětší ji na BASE_W.
+    offset_x/y jsou souřadnice levého horního rohu ořezu v orig. px.
+    """
+    if zoom <= 100:
+        return img, 0, 0
+    # Viditelná oblast = BASE_W * (100/zoom) px z originálu
+    frac   = 100 / zoom
+    crop_w = int(img.width  * frac)
+    crop_h = int(img.height * frac)
+    # Vycentruj kolem průsečíku, ale nepřekračuj okraje
+    ox = max(0, min(cx - crop_w // 2, img.width  - crop_w))
+    oy = max(0, min(cy - crop_h // 2, img.height - crop_h))
+    cropped = img.crop((ox, oy, ox + crop_w, oy + crop_h))
+    zoomed  = cropped.resize((img.width, img.height), Image.LANCZOS)
+    return zoomed, ox, oy
+
+
 def color_table_html(colors, dist_df) -> str:
+    # Pro každý sloupec najdi řádek s minimální vzdáleností (ignoruj řádek A = index 0,
+    # kde je vzdálenost vždy 0; hledáme minimum mezi B–H)
+    col_min_row = {}
+    for c_idx in range(N_COLS):
+        col_vals = dist_df.iloc[1:, c_idx]   # řádky B–H
+        col_min_row[c_idx] = col_vals.values.argmin() + 1  # +1 kvůli offsetu (přeskočili jsme A)
+
     html = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
     html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
     html += "<tr><th style='padding:3px 4px;'></th>"
@@ -113,14 +141,16 @@ def color_table_html(colors, dist_df) -> str:
     for r_idx, row_label in enumerate(ROWS):
         html += f"<tr><td style='padding:3px 4px;font-weight:bold;'>{row_label}</td>"
         for c_idx in range(N_COLS):
-            rgb = colors[r_idx, c_idx].astype(int)
+            rgb  = colors[r_idx, c_idx].astype(int)
             dist = dist_df.iloc[r_idx, c_idx]
             bg   = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
             lum  = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]
             fg   = "#000" if lum > 128 else "#fff"
             border = "2px solid #e00" if r_idx == 0 else "1px solid #ccc"
+            is_min = (r_idx == col_min_row[c_idx])
+            val_style = "font-weight:900;text-decoration:underline;" if is_min else ""
             html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
-                     f"text-align:center;border:{border};min-width:36px;'>"
+                     f"text-align:center;border:{border};min-width:36px;{val_style}'>"
                      f"{dist:.1f}</td>")
         html += "</tr>"
     html += "</table></div>"
@@ -175,46 +205,41 @@ def main():
     if st.session_state.step == 1:
         st.markdown("### 1️⃣ Nastav průsečík na jamku **A1** (levý horní roh)")
 
-        # Zoom slider
-        zoom = st.slider("🔍 Přiblížení", min_value=50, max_value=200,
-                         value=100, step=10, format="%d%%", key="zoom_a1")
-        disp_w = int(BASE_W * zoom / 100)
-        img_d  = resize_to_width(img_orig, disp_w)
+        # Pracovní obrázek – vždy BASE_W px wide, souřadnice jsou v orig px
+        img_d  = resize_to_width(img_orig, BASE_W)
         DW, DH = img_d.width, img_d.height
+        sx, sy = OW / DW, OH / DH   # scale orig → display
 
-        # Výchozí pozice průsečíku – ~10 % od okraje
+        # Výchozí pozice průsečíku v display px (~8 % od okraje)
         if "a1_x" not in st.session_state:
             st.session_state.a1_x = max(1, int(DW * 0.08))
         if "a1_y" not in st.session_state:
             st.session_state.a1_y = max(1, int(DH * 0.08))
 
-        # Při změně zoomu přepočítej pozici průsečíku (zachovej relativní polohu)
-        prev_zoom_key = "prev_zoom_a1"
-        prev_zoom = st.session_state.get(prev_zoom_key, zoom)
-        if prev_zoom != zoom:
-            scale_change = zoom / prev_zoom
-            st.session_state.a1_x = int(st.session_state.a1_x * scale_change)
-            st.session_state.a1_y = int(st.session_state.a1_y * scale_change)
-            st.session_state[prev_zoom_key] = zoom
-
-        # Slidery pro X a Y
-        st.caption("Pohybuj slidery pro přesné umístění průsečíku:")
-        ax = st.slider("← X (vodorovně) →", min_value=0, max_value=DW,
-                       value=min(st.session_state.a1_x, DW), key="sl_a1x")
-        ay = st.slider("↑ Y (svisle) ↓",    min_value=0, max_value=DH,
-                       value=min(st.session_state.a1_y, DH), key="sl_a1y")
+        # Slidery pro X a Y (v display px)
+        st.caption("1. Pohybuj slidery na přibližnou polohu  2. Přibliž  3. Dolaď slidery")
+        ax = st.slider("← X (vodorovně) →", 0, DW,
+                       min(st.session_state.a1_x, DW), key="sl_a1x")
+        ay = st.slider("↑ Y (svisle) ↓",    0, DH,
+                       min(st.session_state.a1_y, DH), key="sl_a1y")
         st.session_state.a1_x = ax
         st.session_state.a1_y = ay
 
-        # Živý náhled s průsečíkem
-        preview = draw_crosshair(img_d, ax, ay, color=(255, 60, 60), size=25)
+        zoom = st.slider("🔍 Přiblížení obrázku", 100, 600,
+                         value=st.session_state.get("zoom_a1", 100),
+                         step=25, format="%d%%", key="zoom_a1")
+
+        # Zoom = crop kolem průsečíku → resize zpět na DW×DH
+        zoomed, off_x, off_y = zoom_crop(img_d, ax, ay, zoom)
+        # Průsečík v souřadnicích zoomedého obrázku
+        ch_x = int((ax - off_x) * zoom / 100)
+        ch_y = int((ay - off_y) * zoom / 100)
+        preview = draw_crosshair(zoomed, ch_x, ch_y, color=(255, 60, 60), size=20)
         st.image(preview, use_container_width=True)
-        st.caption(f"Průsečík: X={ax}, Y={ay}  (v orig: X={int(ax*OW/DW)}, Y={int(ay*OH/DH)})")
+        st.caption(f"Pozice v orig. obrázku: X={int(ax*sx)}, Y={int(ay*sy)}")
 
         if st.button("✅ Potvrdit A1 a pokračovat", type="primary"):
-            real_x = int(ax * OW / DW)
-            real_y = int(ay * OH / DH)
-            st.session_state.pt_a1 = (real_x, real_y)
+            st.session_state.pt_a1 = (int(ax * sx), int(ay * sy))
             st.session_state.step  = 2
             st.rerun()
 
@@ -223,41 +248,36 @@ def main():
         st.success(f"✅ A1 uložena: {st.session_state.pt_a1}")
         st.markdown("### 2️⃣ Nastav průsečík na jamku **H12** (pravý dolní roh)")
 
-        zoom = st.slider("🔍 Přiblížení", min_value=50, max_value=200,
-                         value=100, step=10, format="%d%%", key="zoom_h12")
-        disp_w = int(BASE_W * zoom / 100)
-        img_d  = resize_to_width(img_orig, disp_w)
+        img_d  = resize_to_width(img_orig, BASE_W)
         DW, DH = img_d.width, img_d.height
+        sx, sy = OW / DW, OH / DH
 
         if "h12_x" not in st.session_state:
             st.session_state.h12_x = max(1, int(DW * 0.92))
         if "h12_y" not in st.session_state:
             st.session_state.h12_y = max(1, int(DH * 0.92))
 
-        prev_zoom_key = "prev_zoom_h12"
-        prev_zoom = st.session_state.get(prev_zoom_key, zoom)
-        if prev_zoom != zoom:
-            scale_change = zoom / prev_zoom
-            st.session_state.h12_x = int(st.session_state.h12_x * scale_change)
-            st.session_state.h12_y = int(st.session_state.h12_y * scale_change)
-            st.session_state[prev_zoom_key] = zoom
-
-        st.caption("Pohybuj slidery pro přesné umístění průsečíku:")
-        hx = st.slider("← X (vodorovně) →", min_value=0, max_value=DW,
-                       value=min(st.session_state.h12_x, DW), key="sl_h12x")
-        hy = st.slider("↑ Y (svisle) ↓",    min_value=0, max_value=DH,
-                       value=min(st.session_state.h12_y, DH), key="sl_h12y")
+        st.caption("1. Pohybuj slidery na přibližnou polohu  2. Přibliž  3. Dolaď slidery")
+        hx = st.slider("← X (vodorovně) →", 0, DW,
+                       min(st.session_state.h12_x, DW), key="sl_h12x")
+        hy = st.slider("↑ Y (svisle) ↓",    0, DH,
+                       min(st.session_state.h12_y, DH), key="sl_h12y")
         st.session_state.h12_x = hx
         st.session_state.h12_y = hy
 
-        preview = draw_crosshair(img_d, hx, hy, color=(60, 220, 60), size=25)
+        zoom = st.slider("🔍 Přiblížení obrázku", 100, 600,
+                         value=st.session_state.get("zoom_h12", 100),
+                         step=25, format="%d%%", key="zoom_h12")
+
+        zoomed, off_x, off_y = zoom_crop(img_d, hx, hy, zoom)
+        ch_x = int((hx - off_x) * zoom / 100)
+        ch_y = int((hy - off_y) * zoom / 100)
+        preview = draw_crosshair(zoomed, ch_x, ch_y, color=(60, 220, 60), size=20)
         st.image(preview, use_container_width=True)
-        st.caption(f"Průsečík: X={hx}, Y={hy}  (v orig: X={int(hx*OW/DW)}, Y={int(hy*OH/DH)})")
+        st.caption(f"Pozice v orig. obrázku: X={int(hx*sx)}, Y={int(hy*sy)}")
 
         if st.button("✅ Potvrdit H12 a spustit analýzu", type="primary"):
-            real_x = int(hx * OW / DW)
-            real_y = int(hy * OH / DH)
-            st.session_state.pt_h12 = (real_x, real_y)
+            st.session_state.pt_h12 = (int(hx * sx), int(hy * sy))
             st.session_state.step   = 3
             st.rerun()
 
@@ -277,14 +297,6 @@ def main():
         grid = compute_grid(pt_a1, pt_h12)
 
         st.markdown("### 3️⃣ Detekovaná mřížka")
-        annotated = draw_grid_on_image(
-            resize_to_width(img_orig, BASE_W),
-            compute_grid(
-                (int(pt_a1[0]*BASE_W/OW),  int(pt_a1[1]*BASE_W/OW * (img_orig.height/img_orig.width * BASE_W/BASE_W))),
-                (int(pt_h12[0]*BASE_W/OW), int(pt_h12[1]*BASE_W/OW * (img_orig.height/img_orig.width * BASE_W/BASE_W)))
-            )
-        )
-        # Přesnější vykreslení mřížky v orig rozměrech → zmenšit pro zobrazení
         annotated_orig = draw_grid_on_image(img_orig, grid, pt_a1, pt_h12)
         st.image(resize_to_width(annotated_orig, BASE_W),
                  caption="Žlutá = řádek A  |  Modrá = ostatní  |  Červená = A1  |  Zelená = H12",
@@ -294,11 +306,7 @@ def main():
 
         st.markdown("### 4️⃣ Euklidovské vzdálenosti od řádku A")
         st.markdown(color_table_html(colors, dist_df), unsafe_allow_html=True)
-        st.caption("Každá buňka = RGB vzdálenost od jamky řádku A ve stejném sloupci. Řádek A = 0.")
-
-        st.markdown("#### Numerická tabulka")
-        st.dataframe(dist_df.style.background_gradient(cmap="YlOrRd"),
-                     use_container_width=True)
+        st.caption("Každá buňka = RGB vzdálenost od jamky řádku A ve stejném sloupci. Řádek A = 0. Tučně = nejpodobnější řádku A v daném sloupci.")
 
         csv = dist_df.to_csv(index=True).encode("utf-8")
         st.download_button("⬇️ Stáhnout CSV", data=csv,
