@@ -1,6 +1,6 @@
 """
-Microtiter Plate Analyzer – mobilní verze
-==========================================
+Microtiter Plate Analyzer – mobilní verze v2
+=============================================
 Instalace:
     pip install streamlit pillow numpy pandas
 
@@ -9,12 +9,10 @@ Spuštění:
 """
 
 import streamlit as st
-import streamlit.components.v1 as components
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw
 import math
-import base64
 import io
 
 # ── Konstanty ──────────────────────────────────────────────────────────────────
@@ -23,21 +21,13 @@ COLS          = list(range(1, 13))
 N_ROWS        = len(ROWS)
 N_COLS        = len(COLS)
 SAMPLE_RADIUS = 5
-MAX_W         = 800
+BASE_W        = 700   # základní šířka pro zobrazení
 
 # ── Pomocné funkce ─────────────────────────────────────────────────────────────
 
-def pil_to_b64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode()
-
-
-def resize_for_display(img: Image.Image, max_w: int = MAX_W) -> Image.Image:
-    if img.width <= max_w:
-        return img
-    ratio = max_w / img.width
-    return img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+def resize_to_width(img: Image.Image, width: int) -> Image.Image:
+    ratio = width / img.width
+    return img.resize((width, int(img.height * ratio)), Image.LANCZOS)
 
 
 def compute_grid(pt_a1, pt_h12) -> np.ndarray:
@@ -76,7 +66,23 @@ def build_results(img_array, grid):
     return colors, pd.DataFrame(distances, index=ROWS, columns=[str(c) for c in COLS])
 
 
-def draw_grid_on_image(img: Image.Image, grid: np.ndarray) -> Image.Image:
+def draw_crosshair(img: Image.Image, x: int, y: int,
+                   color: tuple, size: int = 30, thickness: int = 2) -> Image.Image:
+    """Nakreslí průsečík (křížek) na danou pozici."""
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    # Vodorovná čára
+    draw.line([(x - size, y), (x + size, y)], fill=color, width=thickness)
+    # Svislá čára
+    draw.line([(x, y - size), (x, y + size)], fill=color, width=thickness)
+    # Střední tečka
+    r = 5
+    draw.ellipse([x-r, y-r, x+r, y+r], fill=color, outline=(255,255,255), width=1)
+    return out
+
+
+def draw_grid_on_image(img: Image.Image, grid: np.ndarray,
+                        pt_a1=None, pt_h12=None) -> Image.Image:
     out = img.copy().convert("RGB")
     draw = ImageDraw.Draw(out)
     r_draw = max(4, int(min(img.width, img.height) / 120))
@@ -84,12 +90,16 @@ def draw_grid_on_image(img: Image.Image, grid: np.ndarray) -> Image.Image:
         for c in range(N_COLS):
             x, y = grid[r, c]
             color = (255, 220, 0) if r == 0 else (0, 200, 255)
-            draw.ellipse([x-r_draw, y-r_draw, x+r_draw, y+r_draw], outline=color, width=2)
-    x1, y1 = grid[0, 0]
-    x2, y2 = grid[7, 11]
-    s = r_draw * 2
-    draw.ellipse([x1-s, y1-s, x1+s, y1+s], outline=(255, 60, 60), width=3)
-    draw.ellipse([x2-s, y2-s, x2+s, y2+s], outline=(60, 255, 60), width=3)
+            draw.ellipse([x-r_draw, y-r_draw, x+r_draw, y+r_draw],
+                         outline=color, width=2)
+    if pt_a1:
+        x, y = pt_a1
+        s = r_draw * 2
+        draw.ellipse([x-s, y-s, x+s, y+s], outline=(255, 60, 60), width=3)
+    if pt_h12:
+        x, y = pt_h12
+        s = r_draw * 2
+        draw.ellipse([x-s, y-s, x+s, y+s], outline=(60, 255, 60), width=3)
     return out
 
 
@@ -105,9 +115,9 @@ def color_table_html(colors, dist_df) -> str:
         for c_idx in range(N_COLS):
             rgb = colors[r_idx, c_idx].astype(int)
             dist = dist_df.iloc[r_idx, c_idx]
-            bg = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
-            lum = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]
-            fg = "#000" if lum > 128 else "#fff"
+            bg   = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+            lum  = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]
+            fg   = "#000" if lum > 128 else "#fff"
             border = "2px solid #e00" if r_idx == 0 else "1px solid #ccc"
             html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
                      f"text-align:center;border:{border};min-width:36px;'>"
@@ -115,137 +125,6 @@ def color_table_html(colors, dist_df) -> str:
         html += "</tr>"
     html += "</table></div>"
     return html
-
-
-def crosshair_component(img_display: Image.Image, label: str,
-                         color: str, def_x: int, def_y: int) -> dict | None:
-    """
-    Vykreslí interaktivní canvas s posuvným průsečíkem.
-    Vrátí {'x': px, 'y': py} v souřadnicích orig. obrázku po stisknutí tlačítka.
-    scale_x a scale_y jsou zakódovány přímo do HTML.
-    """
-    b64 = pil_to_b64(img_display)
-    dw, dh = img_display.width, img_display.height
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<style>
-* {{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ background:#0e1117; font-family:sans-serif; }}
-#wrap {{
-  position:relative; display:block;
-  width:100%; max-width:{dw}px;
-  touch-action:none; user-select:none; -webkit-user-select:none;
-}}
-#img {{ display:block; width:100%; height:auto; border-radius:8px; }}
-#ch {{
-  position:absolute; pointer-events:none;
-  transform:translate(-50%,-50%);
-  width:0; height:0;
-}}
-.h {{ position:absolute; height:2px; width:48px; background:{color};
-      top:0; left:0; transform:translate(-50%,-50%) translateY(0); margin-left:-24px; margin-top:-1px; }}
-.v {{ position:absolute; width:2px; height:48px; background:{color};
-      top:0; left:0; transform:translate(-50%,-50%); margin-left:-1px; margin-top:-24px; }}
-.dot {{ position:absolute; width:10px; height:10px; border-radius:50%;
-        background:{color}; box-shadow:0 0 8px 3px {color}99;
-        margin-left:-5px; margin-top:-5px; }}
-#lbl {{
-  position:absolute; top:6px; left:8px;
-  background:{color}dd; color:#000; font-weight:bold;
-  font-size:13px; padding:2px 8px; border-radius:6px;
-}}
-#info {{ margin:6px 0; font-size:12px; color:#888; text-align:center; }}
-#btn {{
-  display:block; width:92%; max-width:320px;
-  margin:8px auto 4px; padding:14px;
-  background:{color}; color:#000; font-weight:bold;
-  font-size:16px; border:none; border-radius:10px;
-  cursor:pointer; box-shadow:0 4px 14px {color}55;
-}}
-</style>
-</head>
-<body>
-<div id="wrap">
-  <img id="img" src="data:image/jpeg;base64,{b64}" draggable="false">
-  <div id="ch" style="left:{def_x}px;top:{def_y}px;">
-    <div class="h"></div>
-    <div class="v"></div>
-    <div class="dot"></div>
-  </div>
-  <div id="lbl">{label}</div>
-</div>
-<div id="info">X: <span id="cx">?</span> &nbsp;|&nbsp; Y: <span id="cy">?</span></div>
-<button id="btn">✅ Potvrdit &nbsp;{label}</button>
-
-<script>
-const img = document.getElementById('img');
-const ch  = document.getElementById('ch');
-const cxEl = document.getElementById('cx');
-const cyEl = document.getElementById('cy');
-const btn  = document.getElementById('btn');
-
-// Pozice průsečíku v "procentech" šířky/výšky obrázku
-// (takto je to nezávislé na skutečné velikosti renderu)
-let pctX = {def_x} / {dw};
-let pctY = {def_y} / {dh};
-
-function clamp(v,lo,hi){{ return Math.max(lo,Math.min(hi,v)); }}
-
-function applyPos() {{
-  const r = img.getBoundingClientRect();
-  const px = pctX * r.width;
-  const py = pctY * r.height;
-  ch.style.left = px + 'px';
-  ch.style.top  = py + 'px';
-  cxEl.textContent = Math.round(pctX * {dw});
-  cyEl.textContent = Math.round(pctY * {dh});
-}}
-
-function onDown(e) {{
-  e.preventDefault();
-  move(e);
-}}
-
-function move(e) {{
-  e.preventDefault();
-  const r = img.getBoundingClientRect();
-  let cx, cy;
-  if (e.touches) {{
-    cx = e.touches[0].clientX - r.left;
-    cy = e.touches[0].clientY - r.top;
-  }} else {{
-    cx = e.clientX - r.left;
-    cy = e.clientY - r.top;
-  }}
-  pctX = clamp(cx / r.width,  0, 1);
-  pctY = clamp(cy / r.height, 0, 1);
-  applyPos();
-}}
-
-img.addEventListener('touchstart', onDown, {{passive:false}});
-document.addEventListener('touchmove',  move,  {{passive:false}});
-
-img.addEventListener('mousedown', onDown);
-document.addEventListener('mousemove', e => {{ if (e.buttons) move(e); }});
-
-// Inicializace po načtení obrázku
-img.addEventListener('load', applyPos);
-if (img.complete) applyPos();
-
-btn.addEventListener('click', () => {{
-  window.parent.postMessage({{
-    type: 'streamlit:setComponentValue',
-    value: {{ x: Math.round(pctX * {dw}), y: Math.round(pctY * {dh}) }}
-  }}, '*');
-}});
-</script>
-</body>
-</html>"""
-
-    return components.html(html, height=dh + 120, scrolling=False)
 
 
 # ── Hlavní UI ──────────────────────────────────────────────────────────────────
@@ -260,22 +139,24 @@ def main():
 
     st.markdown("""
     <style>
-      .block-container { padding: 1rem 0.6rem 2rem !important; max-width:100% !important; }
-      h1 { font-size:1.4rem !important; }
+      .block-container { padding:1rem 0.6rem 2rem !important; max-width:100% !important; }
+      h1  { font-size:1.35rem !important; }
       h2, h3 { font-size:1.05rem !important; }
       .stButton>button, .stDownloadButton>button {
-        width:100%; padding:0.75rem; font-size:1rem; border-radius:10px;
+        width:100%; padding:0.8rem; font-size:1rem; border-radius:10px; margin-top:4px;
       }
+      div[data-testid="stSlider"] { padding: 0 4px; }
       iframe { border-radius:10px; }
     </style>
     """, unsafe_allow_html=True)
 
     st.title("🧪 Microtiter Analyzer")
 
-    # Session state
-    for key, val in [("step", 1), ("pt_a1", None), ("pt_h12", None)]:
-        if key not in st.session_state:
-            st.session_state[key] = val
+    # ── Session state ──────────────────────────────────────────────────────────
+    defaults = {"step": 1, "pt_a1": None, "pt_h12": None}
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
     # ── Upload ─────────────────────────────────────────────────────────────────
     st.markdown("### 📷 Nahraj fotografii destičky")
@@ -285,47 +166,109 @@ def main():
         st.info("Vyber nebo vyfoť destičku pomocí tlačítka výše.")
         return
 
-    img_orig    = Image.open(uploaded).convert("RGB")
-    img_display = resize_for_display(img_orig)
-    img_array   = np.array(img_orig)
-    scale_x     = img_orig.width  / img_display.width
-    scale_y     = img_orig.height / img_display.height
+    img_orig  = Image.open(uploaded).convert("RGB")
+    img_array = np.array(img_orig)
+    OW, OH    = img_orig.width, img_orig.height
+    st.success(f"Načteno: {OW}×{OH} px")
 
-    st.success(f"Načteno: {img_orig.width}×{img_orig.height} px")
-
-    # Výchozí souřadnice průsečíků v display px
-    dw, dh = img_display.width, img_display.height
-    DEF_A1_X  = min(70,  dw - 10)
-    DEF_A1_Y  = min(70,  dh - 10)
-    DEF_H12_X = max(dw - 80, 10)
-    DEF_H12_Y = max(dh - 80, 10)
-
-    # ── Krok 1: A1 ────────────────────────────────────────────────────────────
+    # ── Výběr A1 ───────────────────────────────────────────────────────────────
     if st.session_state.step == 1:
-        st.markdown("### 1️⃣ Nastav červený průsečík na jamku **A1**")
-        st.caption("Táhni prstem nebo myší. Pak potvrď tlačítkem.")
-        val = crosshair_component(img_display, "A1", "#ff4444", DEF_A1_X, DEF_A1_Y)
-        if val and isinstance(val, dict) and "x" in val:
-            st.session_state.pt_a1 = (int(val["x"] * scale_x), int(val["y"] * scale_y))
-            st.session_state.step = 2
+        st.markdown("### 1️⃣ Nastav průsečík na jamku **A1** (levý horní roh)")
+
+        # Zoom slider
+        zoom = st.slider("🔍 Přiblížení", min_value=50, max_value=200,
+                         value=100, step=10, format="%d%%", key="zoom_a1")
+        disp_w = int(BASE_W * zoom / 100)
+        img_d  = resize_to_width(img_orig, disp_w)
+        DW, DH = img_d.width, img_d.height
+
+        # Výchozí pozice průsečíku – ~10 % od okraje
+        if "a1_x" not in st.session_state:
+            st.session_state.a1_x = max(1, int(DW * 0.08))
+        if "a1_y" not in st.session_state:
+            st.session_state.a1_y = max(1, int(DH * 0.08))
+
+        # Při změně zoomu přepočítej pozici průsečíku (zachovej relativní polohu)
+        prev_zoom_key = "prev_zoom_a1"
+        prev_zoom = st.session_state.get(prev_zoom_key, zoom)
+        if prev_zoom != zoom:
+            scale_change = zoom / prev_zoom
+            st.session_state.a1_x = int(st.session_state.a1_x * scale_change)
+            st.session_state.a1_y = int(st.session_state.a1_y * scale_change)
+            st.session_state[prev_zoom_key] = zoom
+
+        # Slidery pro X a Y
+        st.caption("Pohybuj slidery pro přesné umístění průsečíku:")
+        ax = st.slider("← X (vodorovně) →", min_value=0, max_value=DW,
+                       value=min(st.session_state.a1_x, DW), key="sl_a1x")
+        ay = st.slider("↑ Y (svisle) ↓",    min_value=0, max_value=DH,
+                       value=min(st.session_state.a1_y, DH), key="sl_a1y")
+        st.session_state.a1_x = ax
+        st.session_state.a1_y = ay
+
+        # Živý náhled s průsečíkem
+        preview = draw_crosshair(img_d, ax, ay, color=(255, 60, 60), size=25)
+        st.image(preview, use_container_width=True)
+        st.caption(f"Průsečík: X={ax}, Y={ay}  (v orig: X={int(ax*OW/DW)}, Y={int(ay*OH/DH)})")
+
+        if st.button("✅ Potvrdit A1 a pokračovat", type="primary"):
+            real_x = int(ax * OW / DW)
+            real_y = int(ay * OH / DH)
+            st.session_state.pt_a1 = (real_x, real_y)
+            st.session_state.step  = 2
             st.rerun()
 
-    # ── Krok 2: H12 ───────────────────────────────────────────────────────────
+    # ── Výběr H12 ──────────────────────────────────────────────────────────────
     elif st.session_state.step == 2:
         st.success(f"✅ A1 uložena: {st.session_state.pt_a1}")
-        st.markdown("### 2️⃣ Nastav zelený průsečík na jamku **H12**")
-        st.caption("Táhni prstem nebo myší. Pak potvrď tlačítkem.")
-        val = crosshair_component(img_display, "H12", "#44ff88", DEF_H12_X, DEF_H12_Y)
-        if val and isinstance(val, dict) and "x" in val:
-            st.session_state.pt_h12 = (int(val["x"] * scale_x), int(val["y"] * scale_y))
-            st.session_state.step = 3
-            st.rerun()
-        if st.button("↩️ Znovu vybrat A1"):
-            st.session_state.step = 1
-            st.session_state.pt_a1 = None
+        st.markdown("### 2️⃣ Nastav průsečík na jamku **H12** (pravý dolní roh)")
+
+        zoom = st.slider("🔍 Přiblížení", min_value=50, max_value=200,
+                         value=100, step=10, format="%d%%", key="zoom_h12")
+        disp_w = int(BASE_W * zoom / 100)
+        img_d  = resize_to_width(img_orig, disp_w)
+        DW, DH = img_d.width, img_d.height
+
+        if "h12_x" not in st.session_state:
+            st.session_state.h12_x = max(1, int(DW * 0.92))
+        if "h12_y" not in st.session_state:
+            st.session_state.h12_y = max(1, int(DH * 0.92))
+
+        prev_zoom_key = "prev_zoom_h12"
+        prev_zoom = st.session_state.get(prev_zoom_key, zoom)
+        if prev_zoom != zoom:
+            scale_change = zoom / prev_zoom
+            st.session_state.h12_x = int(st.session_state.h12_x * scale_change)
+            st.session_state.h12_y = int(st.session_state.h12_y * scale_change)
+            st.session_state[prev_zoom_key] = zoom
+
+        st.caption("Pohybuj slidery pro přesné umístění průsečíku:")
+        hx = st.slider("← X (vodorovně) →", min_value=0, max_value=DW,
+                       value=min(st.session_state.h12_x, DW), key="sl_h12x")
+        hy = st.slider("↑ Y (svisle) ↓",    min_value=0, max_value=DH,
+                       value=min(st.session_state.h12_y, DH), key="sl_h12y")
+        st.session_state.h12_x = hx
+        st.session_state.h12_y = hy
+
+        preview = draw_crosshair(img_d, hx, hy, color=(60, 220, 60), size=25)
+        st.image(preview, use_container_width=True)
+        st.caption(f"Průsečík: X={hx}, Y={hy}  (v orig: X={int(hx*OW/DW)}, Y={int(hy*OH/DH)})")
+
+        if st.button("✅ Potvrdit H12 a spustit analýzu", type="primary"):
+            real_x = int(hx * OW / DW)
+            real_y = int(hy * OH / DH)
+            st.session_state.pt_h12 = (real_x, real_y)
+            st.session_state.step   = 3
             st.rerun()
 
-    # ── Krok 3: Výsledky ──────────────────────────────────────────────────────
+        if st.button("↩️ Zpět – znovu vybrat A1"):
+            st.session_state.step  = 1
+            st.session_state.pt_a1 = None
+            for k in ["a1_x","a1_y","h12_x","h12_y"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    # ── Výsledky ───────────────────────────────────────────────────────────────
     elif st.session_state.step == 3:
         pt_a1  = st.session_state.pt_a1
         pt_h12 = st.session_state.pt_h12
@@ -334,8 +277,16 @@ def main():
         grid = compute_grid(pt_a1, pt_h12)
 
         st.markdown("### 3️⃣ Detekovaná mřížka")
-        annotated = draw_grid_on_image(img_orig, grid)
-        st.image(resize_for_display(annotated),
+        annotated = draw_grid_on_image(
+            resize_to_width(img_orig, BASE_W),
+            compute_grid(
+                (int(pt_a1[0]*BASE_W/OW),  int(pt_a1[1]*BASE_W/OW * (img_orig.height/img_orig.width * BASE_W/BASE_W))),
+                (int(pt_h12[0]*BASE_W/OW), int(pt_h12[1]*BASE_W/OW * (img_orig.height/img_orig.width * BASE_W/BASE_W)))
+            )
+        )
+        # Přesnější vykreslení mřížky v orig rozměrech → zmenšit pro zobrazení
+        annotated_orig = draw_grid_on_image(img_orig, grid, pt_a1, pt_h12)
+        st.image(resize_to_width(annotated_orig, BASE_W),
                  caption="Žlutá = řádek A  |  Modrá = ostatní  |  Červená = A1  |  Zelená = H12",
                  use_container_width=True)
 
@@ -363,10 +314,11 @@ def main():
                 st.dataframe(ch_df, use_container_width=True)
 
         st.markdown("---")
-        if st.button("🔄 Začít znovu"):
+        if st.button("🔄 Začít znovu (nový snímek)"):
+            for k in ["step","pt_a1","pt_h12","a1_x","a1_y","h12_x","h12_y",
+                      "prev_zoom_a1","prev_zoom_h12"]:
+                st.session_state.pop(k, None)
             st.session_state.step = 1
-            st.session_state.pt_a1 = None
-            st.session_state.pt_h12 = None
             st.rerun()
 
 
