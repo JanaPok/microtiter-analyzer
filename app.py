@@ -77,6 +77,7 @@ def build_results(img_array, grid):
         colors    : ndarray of shape (8, 12, 3) with mean RGB per well
         dist_df   : DataFrame (8×12) of Euclidean distances from row A
     """
+    colors = np.zeros((N_ROWS, N_COLS, 3), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
             colors[r, c] = sample_color(img_array, *grid[r, c])
