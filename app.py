@@ -1,10 +1,15 @@
 """
-Microtiter Plate Analyzer – mobilní verze v2
-=============================================
-Instalace:
+Microtiter Plate Analyzer
+=========================
+Mobile-friendly web application for colorimetric analysis of 96-well microtiter plates.
+
+The user photographs a plate, marks two reference wells (A1 and H12), and receives
+a full 8×12 table of Euclidean RGB distances relative to row A.
+
+Installation:
     pip install streamlit pillow numpy pandas
 
-Spuštění:
+Usage:
     streamlit run app.py
 """
 
@@ -15,22 +20,28 @@ from PIL import Image, ImageDraw
 import math
 import io
 
-# ── Konstanty ──────────────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 ROWS          = list("ABCDEFGH")
 COLS          = list(range(1, 13))
 N_ROWS        = len(ROWS)
 N_COLS        = len(COLS)
-SAMPLE_RADIUS = 5
-BASE_W        = 700   # základní šířka pro zobrazení
+SAMPLE_RADIUS = 5     # half-width of the square sampling region (px); full region = 11×11 px
+BASE_W        = 700   # base display width (px)
 
-# ── Pomocné funkce ─────────────────────────────────────────────────────────────
+# ── Helper functions ────────────────────────────────────────────────────────────
 
 def resize_to_width(img: Image.Image, width: int) -> Image.Image:
+    """Resize image to the given width while preserving aspect ratio."""
     ratio = width / img.width
     return img.resize((width, int(img.height * ratio)), Image.LANCZOS)
 
 
 def compute_grid(pt_a1, pt_h12) -> np.ndarray:
+    """
+    Compute center coordinates of all 96 wells by linear interpolation
+    between the two user-defined reference points (A1 and H12).
+    Returns an array of shape (8, 12, 2) — [row, col, (x, y)].
+    """
     x1, y1 = pt_a1
     x2, y2 = pt_h12
     grid = np.zeros((N_ROWS, N_COLS, 2), dtype=float)
@@ -42,6 +53,10 @@ def compute_grid(pt_a1, pt_h12) -> np.ndarray:
 
 
 def sample_color(img_array, x, y, radius=SAMPLE_RADIUS):
+    """
+    Return the mean RGB value of a square region of size (2*radius+1)²
+    centered on pixel (x, y). Clamps to image boundaries.
+    """
     h, w = img_array.shape[:2]
     x0, x1 = max(0, int(x) - radius), min(w, int(x) + radius + 1)
     y0, y1 = max(0, int(y) - radius), min(h, int(y) + radius + 1)
@@ -50,11 +65,18 @@ def sample_color(img_array, x, y, radius=SAMPLE_RADIUS):
 
 
 def euclidean(c1, c2):
+    """Euclidean distance between two RGB color vectors."""
     return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(c1, c2)))
 
 
 def build_results(img_array, grid):
-    colors = np.zeros((N_ROWS, N_COLS, 3), dtype=float)
+    """
+    Sample colors at all 96 well positions and compute per-column Euclidean
+    distances relative to row A (the reference row).
+    Returns:
+        colors    : ndarray of shape (8, 12, 3) with mean RGB per well
+        dist_df   : DataFrame (8×12) of Euclidean distances from row A
+    """
     for r in range(N_ROWS):
         for c in range(N_COLS):
             colors[r, c] = sample_color(img_array, *grid[r, c])
@@ -68,14 +90,14 @@ def build_results(img_array, grid):
 
 def draw_crosshair(img: Image.Image, x: int, y: int,
                    color: tuple, size: int = 30, thickness: int = 2) -> Image.Image:
-    """Nakreslí průsečík (křížek) na danou pozici."""
+    """Draw a crosshair (cross + centre dot) at position (x, y) on a copy of the image."""
     out = img.copy()
     draw = ImageDraw.Draw(out)
-    # Vodorovná čára
+    # Horizontal line
     draw.line([(x - size, y), (x + size, y)], fill=color, width=thickness)
-    # Svislá čára
+    # Vertical line
     draw.line([(x, y - size), (x, y + size)], fill=color, width=thickness)
-    # Střední tečka
+    # Centre dot
     r = 5
     draw.ellipse([x-r, y-r, x+r, y+r], fill=color, outline=(255,255,255), width=1)
     return out
@@ -83,6 +105,12 @@ def draw_crosshair(img: Image.Image, x: int, y: int,
 
 def draw_grid_on_image(img: Image.Image, grid: np.ndarray,
                         pt_a1=None, pt_h12=None) -> Image.Image:
+    """
+    Overlay detected well positions on the image.
+    Row A wells are drawn in yellow; all other rows in cyan.
+    Reference points A1 and H12 are additionally highlighted with larger circles
+    in red and green respectively.
+    """
     out = img.copy().convert("RGB")
     draw = ImageDraw.Draw(out)
     r_draw = max(4, int(min(img.width, img.height) / 120))
@@ -105,18 +133,23 @@ def draw_grid_on_image(img: Image.Image, grid: np.ndarray,
 
 def zoom_crop(img: Image.Image, cx: int, cy: int, zoom: int) -> tuple:
     """
-    Vrátí (oříznutý+zvětšený obrázek, offset_x, offset_y).
-    Při zoom=100 vrátí původní obrázek (bez ořezu).
-    Při zoom>100 ořízne oblast kolem (cx,cy) a zvětší ji na BASE_W.
-    offset_x/y jsou souřadnice levého horního rohu ořezu v orig. px.
+    Return a zoomed view of the image centred on (cx, cy).
+
+    At zoom=100 the original image is returned unchanged (no crop).
+    At zoom>100 a region of size (width * 100/zoom) is cropped around (cx, cy)
+    and upscaled back to the original dimensions, simulating optical zoom.
+
+    Returns:
+        (zoomed_image, offset_x, offset_y)
+        offset_x/y: top-left corner of the crop in original image coordinates
     """
     if zoom <= 100:
         return img, 0, 0
-    # Viditelná oblast = BASE_W * (100/zoom) px z originálu
+    # Visible region size = original size * (100 / zoom)
     frac   = 100 / zoom
     crop_w = int(img.width  * frac)
     crop_h = int(img.height * frac)
-    # Vycentruj kolem průsečíku, ale nepřekračuj okraje
+    # Centre crop on crosshair position, clamped to image boundaries
     ox = max(0, min(cx - crop_w // 2, img.width  - crop_w))
     oy = max(0, min(cy - crop_h // 2, img.height - crop_h))
     cropped = img.crop((ox, oy, ox + crop_w, oy + crop_h))
@@ -125,12 +158,17 @@ def zoom_crop(img: Image.Image, cx: int, cy: int, zoom: int) -> tuple:
 
 
 def color_table_html(colors, dist_df) -> str:
-    # Pro každý sloupec najdi řádek s minimální vzdáleností (ignoruj řádek A = index 0,
-    # kde je vzdálenost vždy 0; hledáme minimum mezi B–H)
+    """
+    Build an HTML table where each cell background reflects the actual well color.
+    The cell value is the Euclidean distance from row A of the same column.
+    The minimum value in each column (rows B–H only) is bold and underlined.
+    """
+    # Find the row with the smallest distance per column, excluding row A (index 0)
+    # where the distance is always 0 by definition
     col_min_row = {}
     for c_idx in range(N_COLS):
-        col_vals = dist_df.iloc[1:, c_idx]   # řádky B–H
-        col_min_row[c_idx] = col_vals.values.argmin() + 1  # +1 kvůli offsetu (přeskočili jsme A)
+        col_vals = dist_df.iloc[1:, c_idx]            # rows B–H
+        col_min_row[c_idx] = col_vals.values.argmin() + 1  # +1 to offset the skipped row A
 
     html = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
     html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
@@ -144,8 +182,8 @@ def color_table_html(colors, dist_df) -> str:
             rgb  = colors[r_idx, c_idx].astype(int)
             dist = dist_df.iloc[r_idx, c_idx]
             bg   = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
-            lum  = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]
-            fg   = "#000" if lum > 128 else "#fff"
+            lum  = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]  # perceived luminance
+            fg   = "#000" if lum > 128 else "#fff"               # black text on light bg, white on dark
             border = "2px solid #e00" if r_idx == 0 else "1px solid #ccc"
             is_min = (r_idx == col_min_row[c_idx])
             val_style = "font-weight:900;text-decoration:underline;" if is_min else ""
@@ -157,7 +195,7 @@ def color_table_html(colors, dist_df) -> str:
     return html
 
 
-# ── Hlavní UI ──────────────────────────────────────────────────────────────────
+# ── Main UI ────────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(
@@ -167,6 +205,7 @@ def main():
         initial_sidebar_state="collapsed"
     )
 
+    # Mobile-friendly CSS overrides
     st.markdown("""
     <style>
       .block-container { padding:1rem 0.6rem 2rem !important; max-width:100% !important; }
@@ -182,90 +221,91 @@ def main():
 
     st.title("🧪 Microtiter Analyzer")
 
-    # ── Session state ──────────────────────────────────────────────────────────
+    # ── Session state initialisation ───────────────────────────────────────────
     defaults = {"step": 1, "pt_a1": None, "pt_h12": None}
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # ── Upload ─────────────────────────────────────────────────────────────────
-    st.markdown("### 📷 Nahraj fotografii destičky")
-    uploaded = st.file_uploader("JPG nebo PNG", type=["jpg","jpeg","png"],
+    # ── Step 0: Image upload ───────────────────────────────────────────────────
+    st.markdown("### 📷 Upload a plate photograph")
+    uploaded = st.file_uploader("JPG or PNG", type=["jpg","jpeg","png"],
                                 label_visibility="collapsed")
     if not uploaded:
-        st.info("Vyber nebo vyfoť destičku pomocí tlačítka výše.")
+        st.info("Select or photograph the plate using the button above.")
         return
 
     img_orig  = Image.open(uploaded).convert("RGB")
     img_array = np.array(img_orig)
     OW, OH    = img_orig.width, img_orig.height
-    st.success(f"Načteno: {OW}×{OH} px")
+    st.success(f"Image loaded: {OW}×{OH} px")
 
-    # ── Výběr A1 ───────────────────────────────────────────────────────────────
+    # ── Step 1: Select well A1 ─────────────────────────────────────────────────
     if st.session_state.step == 1:
-        st.markdown("### 1️⃣ Nastav průsečík na jamku **A1** (levý horní roh)")
+        st.markdown("### 1️⃣ Position the crosshair on well **A1** (top-left corner)")
 
-        # Pracovní obrázek – vždy BASE_W px wide, souřadnice jsou v orig px
+        # Working image — always BASE_W px wide; crosshair coordinates are in display px
         img_d  = resize_to_width(img_orig, BASE_W)
         DW, DH = img_d.width, img_d.height
-        sx, sy = OW / DW, OH / DH   # scale orig → display
+        sx, sy = OW / DW, OH / DH   # scale factors: display px → original px
 
-        # Výchozí pozice průsečíku v display px (~8 % od okraje)
+        # Default crosshair position (~8 % from the top-left corner)
         if "a1_x" not in st.session_state:
             st.session_state.a1_x = max(1, int(DW * 0.08))
         if "a1_y" not in st.session_state:
             st.session_state.a1_y = max(1, int(DH * 0.08))
 
-        # Slidery pro X a Y (v display px)
-        st.caption("1. Pohybuj slidery na přibližnou polohu  2. Přibliž  3. Dolaď slidery")
-        ax = st.slider("← X (vodorovně) →", 0, DW,
+        # X / Y sliders (values in display px)
+        st.caption("1. Move sliders to approximate position  2. Zoom in  3. Fine-tune sliders")
+        ax = st.slider("← X (horizontal) →", 0, DW,
                        min(st.session_state.a1_x, DW), key="sl_a1x")
-        ay = st.slider("↑ Y (svisle) ↓",    0, DH,
+        ay = st.slider("↑ Y (vertical) ↓",   0, DH,
                        min(st.session_state.a1_y, DH), key="sl_a1y")
         st.session_state.a1_x = ax
         st.session_state.a1_y = ay
 
-        zoom = st.slider("🔍 Přiblížení obrázku", 100, 600,
+        zoom = st.slider("🔍 Zoom", 100, 600,
                          value=st.session_state.get("zoom_a1", 100),
                          step=25, format="%d%%", key="zoom_a1")
 
-        # Zoom = crop kolem průsečíku → resize zpět na DW×DH
+        # Crop around the crosshair and upscale to simulate zoom
         zoomed, off_x, off_y = zoom_crop(img_d, ax, ay, zoom)
-        # Průsečík v souřadnicích zoomedého obrázku
+        # Crosshair position in the zoomed image coordinate system
         ch_x = int((ax - off_x) * zoom / 100)
         ch_y = int((ay - off_y) * zoom / 100)
         preview = draw_crosshair(zoomed, ch_x, ch_y, color=(255, 60, 60), size=20)
         st.image(preview, use_container_width=True)
-        st.caption(f"Pozice v orig. obrázku: X={int(ax*sx)}, Y={int(ay*sy)}")
+        st.caption(f"Position in original image: X={int(ax*sx)}, Y={int(ay*sy)}")
 
-        if st.button("✅ Potvrdit A1 a pokračovat", type="primary"):
+        if st.button("✅ Confirm A1 and continue", type="primary"):
             st.session_state.pt_a1 = (int(ax * sx), int(ay * sy))
             st.session_state.step  = 2
             st.rerun()
 
-    # ── Výběr H12 ──────────────────────────────────────────────────────────────
+    # ── Step 2: Select well H12 ────────────────────────────────────────────────
     elif st.session_state.step == 2:
-        st.success(f"✅ A1 uložena: {st.session_state.pt_a1}")
-        st.markdown("### 2️⃣ Nastav průsečík na jamku **H12** (pravý dolní roh)")
+        st.success(f"✅ A1 saved: {st.session_state.pt_a1}")
+        st.markdown("### 2️⃣ Position the crosshair on well **H12** (bottom-right corner)")
 
         img_d  = resize_to_width(img_orig, BASE_W)
         DW, DH = img_d.width, img_d.height
         sx, sy = OW / DW, OH / DH
 
+        # Default crosshair position (~92 % from the top-left corner)
         if "h12_x" not in st.session_state:
             st.session_state.h12_x = max(1, int(DW * 0.92))
         if "h12_y" not in st.session_state:
             st.session_state.h12_y = max(1, int(DH * 0.92))
 
-        st.caption("1. Pohybuj slidery na přibližnou polohu  2. Přibliž  3. Dolaď slidery")
-        hx = st.slider("← X (vodorovně) →", 0, DW,
+        st.caption("1. Move sliders to approximate position  2. Zoom in  3. Fine-tune sliders")
+        hx = st.slider("← X (horizontal) →", 0, DW,
                        min(st.session_state.h12_x, DW), key="sl_h12x")
-        hy = st.slider("↑ Y (svisle) ↓",    0, DH,
+        hy = st.slider("↑ Y (vertical) ↓",   0, DH,
                        min(st.session_state.h12_y, DH), key="sl_h12y")
         st.session_state.h12_x = hx
         st.session_state.h12_y = hy
 
-        zoom = st.slider("🔍 Přiblížení obrázku", 100, 600,
+        zoom = st.slider("🔍 Zoom", 100, 600,
                          value=st.session_state.get("zoom_h12", 100),
                          step=25, format="%d%%", key="zoom_h12")
 
@@ -274,21 +314,21 @@ def main():
         ch_y = int((hy - off_y) * zoom / 100)
         preview = draw_crosshair(zoomed, ch_x, ch_y, color=(60, 220, 60), size=20)
         st.image(preview, use_container_width=True)
-        st.caption(f"Pozice v orig. obrázku: X={int(hx*sx)}, Y={int(hy*sy)}")
+        st.caption(f"Position in original image: X={int(hx*sx)}, Y={int(hy*sy)}")
 
-        if st.button("✅ Potvrdit H12 a spustit analýzu", type="primary"):
+        if st.button("✅ Confirm H12 and run analysis", type="primary"):
             st.session_state.pt_h12 = (int(hx * sx), int(hy * sy))
             st.session_state.step   = 3
             st.rerun()
 
-        if st.button("↩️ Zpět – znovu vybrat A1"):
+        if st.button("↩️ Back — reselect A1"):
             st.session_state.step  = 1
             st.session_state.pt_a1 = None
             for k in ["a1_x","a1_y","h12_x","h12_y"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
-    # ── Výsledky ───────────────────────────────────────────────────────────────
+    # ── Step 3: Results ────────────────────────────────────────────────────────
     elif st.session_state.step == 3:
         pt_a1  = st.session_state.pt_a1
         pt_h12 = st.session_state.pt_h12
@@ -296,33 +336,34 @@ def main():
 
         grid = compute_grid(pt_a1, pt_h12)
 
-        st.markdown("### 3️⃣ Detekovaná mřížka")
+        st.markdown("### 3️⃣ Detected well grid")
         annotated_orig = draw_grid_on_image(img_orig, grid, pt_a1, pt_h12)
         st.image(resize_to_width(annotated_orig, BASE_W),
-                 caption="Žlutá = řádek A  |  Modrá = ostatní  |  Červená = A1  |  Zelená = H12",
+                 caption="Yellow = row A  |  Cyan = other rows  |  Red = A1  |  Green = H12",
                  use_container_width=True)
 
         colors, dist_df = build_results(img_array, grid)
 
-        st.markdown("### 4️⃣ Euklidovské vzdálenosti od řádku A")
+        st.markdown("### 4️⃣ Euclidean distances from row A")
         st.markdown(color_table_html(colors, dist_df), unsafe_allow_html=True)
-        st.caption("Každá buňka = RGB vzdálenost od jamky řádku A ve stejném sloupci. Řádek A = 0. Tučně = nejpodobnější řádku A v daném sloupci.")
+        st.caption("Each cell = Euclidean RGB distance from the row A well in the same column. "
+                   "Row A = 0 (reference). Bold + underline = most similar to row A in that column.")
 
         csv = dist_df.to_csv(index=True).encode("utf-8")
-        st.download_button("⬇️ Stáhnout CSV", data=csv,
+        st.download_button("⬇️ Download CSV", data=csv,
                            file_name="microtiter_distances.csv", mime="text/csv")
 
-        with st.expander("🔬 Průměrné RGB hodnoty jamek"):
+        with st.expander("🔬 Mean RGB values per well"):
             for ch_idx, ch_name in enumerate(["R", "G", "B"]):
                 ch_df = pd.DataFrame(
                     colors[:, :, ch_idx].astype(int),
                     index=ROWS, columns=[str(c) for c in COLS]
                 )
-                st.write(f"**Kanál {ch_name}**")
+                st.write(f"**Channel {ch_name}**")
                 st.dataframe(ch_df, use_container_width=True)
 
         st.markdown("---")
-        if st.button("🔄 Začít znovu (nový snímek)"):
+        if st.button("🔄 Start over (new image)"):
             for k in ["step","pt_a1","pt_h12","a1_x","a1_y","h12_x","h12_y",
                       "prev_zoom_a1","prev_zoom_h12"]:
                 st.session_state.pop(k, None)
