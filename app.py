@@ -76,22 +76,39 @@ def euclidean(c1, c2):
 
 def build_results(img_array, grid):
     """
-    Sample colors at all 96 well positions and compute per-column Euclidean
-    distances relative to row A (the reference row).
+    Sample colors at all 96 well positions and compute Euclidean RGB distances
+    relative to a single reference vector derived from row A.
+
+    The reference is the mean RGB vector of all 12 wells in row A, where each
+    well is weighted by its perceptual luminance (ITU-R BT.601):
+        L = 0.299·R + 0.587·G + 0.114·B
+    Wells with higher luminance contribute more to the reference, reflecting
+    the fact that brighter, more saturated wells carry more colorimetric signal.
+
     Returns:
-        colors    : ndarray of shape (8, 12, 3) with mean RGB per well
-        dist_df   : DataFrame (8×12) of Euclidean distances from row A
+        colors   : ndarray of shape (8, 12, 3) with mean RGB per well
+        dist_df  : DataFrame (8×12) of Euclidean distances from the row-A reference
+        ref_rgb  : 1-D array (3,) — the reference RGB vector used
     """
     colors = np.zeros((N_ROWS, N_COLS, 3), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
             colors[r, c] = sample_color(img_array, *grid[r, c])
+
+    # Compute perceptual luminance weights for row A wells
+    row_a   = colors[0, :, :]                                      # shape (12, 3)
+    lum_a   = 0.299*row_a[:, 0] + 0.587*row_a[:, 1] + 0.114*row_a[:, 2]  # shape (12,)
+    weights = lum_a / lum_a.sum() if lum_a.sum() > 0 else np.ones(N_COLS) / N_COLS
+    ref_rgb = (row_a * weights[:, np.newaxis]).sum(axis=0)         # weighted mean RGB
+
+    # Euclidean distance of every well from the single row-A reference
     distances = np.zeros((N_ROWS, N_COLS), dtype=float)
-    for c in range(N_COLS):
-        ref = colors[0, c]
-        for r in range(N_ROWS):
-            distances[r, c] = euclidean(ref, colors[r, c])
-    return colors, pd.DataFrame(distances, index=ROWS, columns=[str(c) for c in COLS])
+    for r in range(N_ROWS):
+        for c in range(N_COLS):
+            distances[r, c] = euclidean(ref_rgb, colors[r, c])
+
+    dist_df = pd.DataFrame(distances, index=ROWS, columns=[str(c) for c in COLS])
+    return colors, dist_df, ref_rgb
 
 
 def draw_crosshair(img: Image.Image, x: int, y: int,
@@ -163,20 +180,33 @@ def zoom_crop(img: Image.Image, cx: int, cy: int, zoom: int) -> tuple:
     return zoomed, ox, oy
 
 
-def color_table_html(colors, dist_df) -> str:
+def color_table_html(colors, dist_df, ref_rgb) -> str:
     """
     Build an HTML table where each cell background reflects the actual well color.
-    The cell value is the Euclidean distance from row A of the same column.
-    The minimum value in each column (rows B–H only) is bold and underlined.
+    Cell value = Euclidean RGB distance from the single row-A reference vector.
+    The minimum value in each column (rows B–H) is bold and underlined.
+    Row A is highlighted with a red border to mark it as the reference row.
     """
-    # Find the row with the smallest distance per column, excluding row A (index 0)
-    # where the distance is always 0 by definition
+    # Find the row index of the minimum distance per column (rows B–H only)
     col_min_row = {}
     for c_idx in range(N_COLS):
-        col_vals = dist_df.iloc[1:, c_idx]            # rows B–H
+        col_vals = dist_df.iloc[1:, c_idx]
         col_min_row[c_idx] = col_vals.values.argmin() + 1  # +1 to offset the skipped row A
 
-    html = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+    # Reference colour swatch for display
+    r_ref, g_ref, b_ref = ref_rgb.astype(int)
+    lum_ref = 0.299*r_ref + 0.587*g_ref + 0.114*b_ref
+    fg_ref  = "#000" if lum_ref > 128 else "#fff"
+    ref_swatch = (
+        f"<div style='display:inline-block;width:18px;height:18px;border-radius:3px;"
+        f"background:rgb({r_ref},{g_ref},{b_ref});border:1px solid #999;"
+        f"vertical-align:middle;margin-right:5px;'></div>"
+        f"<span style='font-size:11px;'>Reference (row A mean): "
+        f"R={r_ref} G={g_ref} B={b_ref}</span>"
+    )
+
+    html  = f"<div style='margin-bottom:6px;'>{ref_swatch}</div>"
+    html += '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
     html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
     html += "<tr><th style='padding:3px 4px;'></th>"
     for c in COLS:
@@ -188,11 +218,10 @@ def color_table_html(colors, dist_df) -> str:
             rgb  = colors[r_idx, c_idx].astype(int)
             dist = dist_df.iloc[r_idx, c_idx]
             bg   = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
-            lum  = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]  # perceived luminance
-            fg   = "#000" if lum > 128 else "#fff"               # black text on light bg, white on dark
-            border = "2px solid #e00" if r_idx == 0 else "1px solid #ccc"
-            is_min = (r_idx == col_min_row[c_idx])
-            val_style = "font-weight:900;text-decoration:underline;" if is_min else ""
+            lum  = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]
+            fg   = "#000" if lum > 128 else "#fff"
+            border    = "2px solid #e00" if r_idx == 0 else "1px solid #ccc"
+            val_style = "font-weight:900;text-decoration:underline;" if r_idx == col_min_row[c_idx] else ""
             html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
                      f"text-align:center;border:{border};min-width:36px;{val_style}'>"
                      f"{dist:.1f}</td>")
@@ -542,12 +571,12 @@ def main():
                  caption="Yellow = row A  |  Cyan = other rows  |  Red = A1  |  Green = H12",
                  use_container_width=True)
 
-        colors, dist_df = build_results(img_array, grid)
+        colors, dist_df, ref_rgb = build_results(img_array, grid)
 
-        st.markdown("### 4️⃣ Euclidean distances from row A")
-        st.markdown(color_table_html(colors, dist_df), unsafe_allow_html=True)
-        st.caption("Each cell = Euclidean RGB distance from the row A well in the same column. "
-                   "Row A = 0 (reference). Bold + underline = most similar to row A in that column.")
+        st.markdown("### 4️⃣ Euclidean distances from row A reference")
+        st.markdown(color_table_html(colors, dist_df, ref_rgb), unsafe_allow_html=True)
+        st.caption("Each cell = Euclidean RGB distance from the luminance-weighted mean RGB of row A (all 12 wells). "
+                   "Row A border = reference row. Bold + underline = most similar to reference in that column.")
 
         csv = dist_df.to_csv(index=True).encode("utf-8")
         st.download_button("⬇️ Download distances CSV", data=csv,
