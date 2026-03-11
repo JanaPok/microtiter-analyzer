@@ -313,6 +313,88 @@ def export_grayscale_excel(gray_df: pd.DataFrame, img_orig: Image.Image,
     return buf.getvalue()
 
 
+def inverted_table_html(gray_df: pd.DataFrame) -> str:
+    """
+    Build an HTML table showing pseudo-absorbance (255 - grayscale) per well.
+    Higher value = darker well = stronger reaction.
+    Cell background is the inverted gray shade for visual consistency.
+    """
+    html = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+    html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
+    html += "<tr><th style='padding:3px 4px;'></th>"
+    for c in COLS:
+        html += f"<th style='padding:3px 4px;text-align:center;'>{c}</th>"
+    html += "</tr>"
+    for r_idx, row_label in enumerate(ROWS):
+        html += f"<tr><td style='padding:3px 4px;font-weight:bold;'>{row_label}</td>"
+        for c_idx in range(N_COLS):
+            g_inv  = 255 - int(gray_df.iloc[r_idx, c_idx])
+            # Background uses the inverted shade so darker = higher value visually
+            bg     = f"rgb({g_inv},{g_inv},{g_inv})"
+            fg     = "#000" if g_inv > 128 else "#fff"
+            html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
+                     f"text-align:center;border:1px solid #ccc;min-width:36px;'>"
+                     f"{g_inv}</td>")
+        html += "</tr>"
+    html += "</table></div>"
+    return html
+
+
+def export_inverted_excel(gray_df: pd.DataFrame) -> bytes:
+    """
+    Create a formatted Excel workbook with the pseudo-absorbance table (255 - grayscale).
+    Each cell background reflects the inverted gray shade (darker = higher value).
+    Returns the workbook as bytes.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Pseudo-absorbance"
+
+    thin   = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Header row
+    ws.cell(row=1, column=1, value="")
+    for c_idx, c_label in enumerate(COLS):
+        cell = ws.cell(row=1, column=c_idx + 2, value=c_label)
+        cell.font      = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        cell.border    = border
+
+    # Data rows
+    for r_idx, row_label in enumerate(ROWS):
+        hdr = ws.cell(row=r_idx + 2, column=1, value=row_label)
+        hdr.font      = Font(bold=True)
+        hdr.alignment = Alignment(horizontal="center")
+        hdr.border    = border
+
+        for c_idx in range(N_COLS):
+            g_inv  = 255 - int(gray_df.iloc[r_idx, c_idx])
+            cell   = ws.cell(row=r_idx + 2, column=c_idx + 2, value=g_inv)
+            hex_g  = f"{g_inv:02X}"
+            hex_col = hex_g * 3
+            cell.fill      = PatternFill("solid", fgColor=hex_col)
+            cell.font      = Font(color="000000" if g_inv > 128 else "FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+            cell.border    = border
+
+    # Column widths
+    ws.column_dimensions["A"].width = 5
+    for c_idx in range(N_COLS):
+        ws.column_dimensions[get_column_letter(c_idx + 2)].width = 6
+
+    # Metadata sheet
+    ws_meta = wb.create_sheet("Info")
+    ws_meta.append(["Microtiter Plate Analyzer — pseudo-absorbance export"])
+    ws_meta.append(["Values = 255 - grayscale intensity (0=white/no reaction, 255=black/full reaction)"])
+    ws_meta.append(["Higher value = darker well = stronger colorimetric reaction"])
+    ws_meta.append(["Grayscale conversion: ITU-R BT.601 (PIL Image.convert('L'))"])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # ── Main UI ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -480,12 +562,26 @@ def main():
         gray_df = build_grayscale(img_orig, grid)
         st.markdown(grayscale_table_html(gray_df), unsafe_allow_html=True)
 
-        # Excel export
         xlsx_bytes = export_grayscale_excel(gray_df, img_orig, grid)
         st.download_button(
             label="⬇️ Download grayscale table (Excel)",
             data=xlsx_bytes,
             file_name="microtiter_grayscale.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        # ── Pseudo-absorbance table (255 − grayscale) ─────────────────────────
+        st.markdown("### 6️⃣ Pseudo-absorbance per well (255 − grayscale)")
+        st.caption("Inverted grayscale: higher value = darker well = stronger colorimetric reaction. "
+                   "Approximates the concept of absorbance measured by a plate reader.")
+
+        st.markdown(inverted_table_html(gray_df), unsafe_allow_html=True)
+
+        inv_xlsx_bytes = export_inverted_excel(gray_df)
+        st.download_button(
+            label="⬇️ Download pseudo-absorbance table (Excel)",
+            data=inv_xlsx_bytes,
+            file_name="microtiter_pseudoabsorbance.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
