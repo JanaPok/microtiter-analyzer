@@ -3,11 +3,13 @@ Microtiter Plate Analyzer
 =========================
 Mobile-friendly web application for colorimetric analysis of 96-well microtiter plates.
 
-The user photographs a plate, marks two reference wells (A1 and H12), and receives
-a full 8×12 table of Euclidean RGB distances relative to row A.
+The user photographs a plate, marks two reference wells (A1 and H12), and receives:
+  1. A table of Euclidean RGB distances relative to row A (per column).
+  2. A grayscale intensity table (0 = black, 255 = white) for each well.
+     The grayscale table can be downloaded as a formatted Excel file.
 
 Installation:
-    pip install streamlit pillow numpy pandas
+    pip install streamlit pillow numpy pandas openpyxl
 
 Usage:
     streamlit run app.py
@@ -19,6 +21,9 @@ import pandas as pd
 from PIL import Image, ImageDraw
 import math
 import io
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ROWS          = list("ABCDEFGH")
@@ -196,6 +201,118 @@ def color_table_html(colors, dist_df) -> str:
     return html
 
 
+def build_grayscale(img_orig: Image.Image, grid: np.ndarray) -> pd.DataFrame:
+    """
+    Convert the image to grayscale and sample the mean intensity (0–255)
+    at each of the 96 well positions.
+    Returns a DataFrame (8×12) of integer grayscale values.
+    """
+    img_gray  = img_orig.convert("L")          # standard luminance grayscale
+    gray_array = np.array(img_gray, dtype=float)
+    values = np.zeros((N_ROWS, N_COLS), dtype=float)
+    h, w   = gray_array.shape
+    for r in range(N_ROWS):
+        for c in range(N_COLS):
+            x, y = grid[r, c]
+            x0, x1 = max(0, int(x) - SAMPLE_RADIUS), min(w, int(x) + SAMPLE_RADIUS + 1)
+            y0, y1 = max(0, int(y) - SAMPLE_RADIUS), min(h, int(y) + SAMPLE_RADIUS + 1)
+            values[r, c] = gray_array[y0:y1, x0:x1].mean()
+    return pd.DataFrame(
+        np.round(values).astype(int),
+        index=ROWS,
+        columns=[str(c) for c in COLS]
+    )
+
+
+def grayscale_table_html(gray_df: pd.DataFrame) -> str:
+    """
+    Build an HTML table showing grayscale intensity per well.
+    Cell background matches the actual gray shade; text colour adapts for contrast.
+    """
+    html = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+    html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
+    html += "<tr><th style='padding:3px 4px;'></th>"
+    for c in COLS:
+        html += f"<th style='padding:3px 4px;text-align:center;'>{c}</th>"
+    html += "</tr>"
+    for r_idx, row_label in enumerate(ROWS):
+        html += f"<tr><td style='padding:3px 4px;font-weight:bold;'>{row_label}</td>"
+        for c_idx in range(N_COLS):
+            g      = int(gray_df.iloc[r_idx, c_idx])
+            bg     = f"rgb({g},{g},{g})"
+            fg     = "#000" if g > 128 else "#fff"
+            border = "1px solid #ccc"
+            html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
+                     f"text-align:center;border:{border};min-width:36px;'>"
+                     f"{g}</td>")
+        html += "</tr>"
+    html += "</table></div>"
+    return html
+
+
+def export_grayscale_excel(gray_df: pd.DataFrame, img_orig: Image.Image,
+                           grid: np.ndarray) -> bytes:
+    """
+    Create a formatted Excel workbook with the grayscale intensity table.
+    Each cell:
+      - displays the integer grayscale value (0–255)
+      - has a background fill matching the actual gray shade of that well
+      - uses black or white text for legibility
+    Column headers (1–12) and row headers (A–H) are included.
+    Returns the workbook as bytes suitable for st.download_button.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Grayscale intensities"
+
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # ── Header row (column numbers) ────────────────────────────────────────────
+    ws.cell(row=1, column=1, value="")           # top-left corner cell (empty)
+    for c_idx, c_label in enumerate(COLS):
+        cell = ws.cell(row=1, column=c_idx + 2, value=c_label)
+        cell.font      = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        cell.border    = border
+
+    # ── Data rows ──────────────────────────────────────────────────────────────
+    for r_idx, row_label in enumerate(ROWS):
+        # Row letter header
+        hdr = ws.cell(row=r_idx + 2, column=1, value=row_label)
+        hdr.font      = Font(bold=True)
+        hdr.alignment = Alignment(horizontal="center")
+        hdr.border    = border
+
+        for c_idx in range(N_COLS):
+            g    = int(gray_df.iloc[r_idx, c_idx])
+            cell = ws.cell(row=r_idx + 2, column=c_idx + 2, value=g)
+
+            # Gray fill — openpyxl expects a 6-digit hex colour string
+            hex_g  = f"{g:02X}"
+            hex_col = hex_g * 3          # e.g. "7F7F7F"
+            cell.fill      = PatternFill("solid", fgColor=hex_col)
+            cell.font      = Font(color="000000" if g > 128 else "FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+            cell.border    = border
+
+    # ── Column widths ──────────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 5   # row-label column
+    for c_idx in range(N_COLS):
+        ws.column_dimensions[get_column_letter(c_idx + 2)].width = 6
+
+    # ── Metadata sheet ─────────────────────────────────────────────────────────
+    ws_meta = wb.create_sheet("Info")
+    ws_meta.append(["Microtiter Plate Analyzer — grayscale export"])
+    ws_meta.append(["Values represent mean grayscale intensity (0=black, 255=white)"])
+    ws_meta.append(["Sampling region: 11×11 px centred on each well"])
+    ws_meta.append(["Grayscale conversion: ITU-R BT.601 (PIL Image.convert('L'))"])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # ── Main UI ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -351,8 +468,26 @@ def main():
                    "Row A = 0 (reference). Bold + underline = most similar to row A in that column.")
 
         csv = dist_df.to_csv(index=True).encode("utf-8")
-        st.download_button("⬇️ Download CSV", data=csv,
+        st.download_button("⬇️ Download distances CSV", data=csv,
                            file_name="microtiter_distances.csv", mime="text/csv")
+
+        # ── Grayscale intensity table ──────────────────────────────────────────
+        st.markdown("### 5️⃣ Grayscale intensity per well")
+        st.caption("The image is converted to grayscale (ITU-R BT.601). "
+                   "Each value is the mean pixel intensity (0 = black, 255 = white) "
+                   "sampled from an 11×11 px region centred on the well.")
+
+        gray_df = build_grayscale(img_orig, grid)
+        st.markdown(grayscale_table_html(gray_df), unsafe_allow_html=True)
+
+        # Excel export
+        xlsx_bytes = export_grayscale_excel(gray_df, img_orig, grid)
+        st.download_button(
+            label="⬇️ Download grayscale table (Excel)",
+            data=xlsx_bytes,
+            file_name="microtiter_grayscale.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
         with st.expander("🔬 Mean RGB values per well"):
             for ch_idx, ch_name in enumerate(["R", "G", "B"]):
