@@ -342,6 +342,132 @@ def export_grayscale_excel(gray_df: pd.DataFrame, img_orig: Image.Image,
     return buf.getvalue()
 
 
+def build_absorbance(img_orig: Image.Image, grid: np.ndarray) -> pd.DataFrame:
+    """
+    Compute corrected absorbance for each well using:
+        gray_blank = mean of brightest 10% pixels
+        gray_mean  = mean of all pixels
+        A = -log10(gray_mean / gray_blank)
+        k = 1.0 + 0.5 * (1 - gray_blank/255)**2
+        A_corrected = A * k
+    """
+    img_gray = img_orig.convert("L")
+    gray_array = np.array(img_gray, dtype=float)
+    h, w = gray_array.shape
+
+    absorb = np.zeros((N_ROWS, N_COLS), dtype=float)
+
+    for r in range(N_ROWS):
+        for c in range(N_COLS):
+            x, y = grid[r, c]
+            x0, x1 = max(0, int(x) - SAMPLE_RADIUS), min(w, int(x) + SAMPLE_RADIUS + 1)
+            y0, y1 = max(0, int(y) - SAMPLE_RADIUS), min(h, int(y) + SAMPLE_RADIUS + 1)
+
+            patch = gray_array[y0:y1, x0:x1].reshape(-1)
+
+            gray_mean = patch.mean()
+
+            # 10% brightest pixels
+            k10 = max(1, int(len(patch) * 0.10))
+            gray_blank = np.sort(patch)[-k10:].mean()
+
+            T = gray_mean / gray_blank if gray_blank > 0 else 1.0
+            A = -math.log10(T) if T > 0 else 0.0
+
+            k_corr = 1.0 + 0.5 * (1 - gray_blank / 255.0)**2
+
+            absorb[r, c] = A * k_corr
+
+    return pd.DataFrame(
+        np.round(absorb, 3),
+        index=ROWS,
+        columns=[str(c) for c in COLS]
+    )
+
+def absorbance_table_html(abs_df: pd.DataFrame) -> str:
+    html = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+    html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
+    html += "<tr><th style='padding:3px 4px;'></th>"
+
+    for c in COLS:
+        html += f"<th style='padding:3px 4px;text-align:center;'>{c}</th>"
+    html += "</tr>"
+
+    for r_idx, row_label in enumerate(ROWS):
+        html += f"<tr><td style='padding:3px 4px;font-weight:bold;'>{row_label}</td>"
+        for c_idx in range(N_COLS):
+            val = float(abs_df.iloc[r_idx, c_idx])
+
+            # Visual shading: darker = higher absorbance
+            shade = int(max(0, min(255, 255 - val * 140)))
+            bg = f"rgb({shade},{shade},{shade})"
+            fg = "#000" if shade > 128 else "#fff"
+
+            html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
+                     f"text-align:center;border:1px solid #ccc;min-width:36px;'>"
+                     f"{val:.3f}</td>")
+        html += "</tr>"
+
+    html += "</table></div>"
+    return html
+
+def export_absorbance_excel(abs_df: pd.DataFrame) -> bytes:
+    """
+    Export corrected absorbance values to Excel.
+    Background shading reflects absorbance (darker = higher).
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Absorbance"
+
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Header row
+    ws.cell(row=1, column=1, value="")
+    for c_idx, c_label in enumerate(COLS):
+        cell = ws.cell(row=1, column=c_idx + 2, value=c_label)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = border
+
+    # Data rows
+    for r_idx, row_label in enumerate(ROWS):
+        hdr = ws.cell(row=r_idx + 2, column=1, value=row_label)
+        hdr.font = Font(bold=True)
+        hdr.alignment = Alignment(horizontal="center")
+        hdr.border = border
+
+        for c_idx in range(N_COLS):
+            val = float(abs_df.iloc[r_idx, c_idx])
+            cell = ws.cell(row=r_idx + 2, column=c_idx + 2, value=val)
+
+            shade = int(max(0, min(255, 255 - val * 140)))
+            hex_g = f"{shade:02X}"
+            hex_col = hex_g * 3
+
+            cell.fill = PatternFill("solid", fgColor=hex_col)
+            cell.font = Font(color="000000" if shade > 128 else "FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = border
+
+    ws.column_dimensions["A"].width = 5
+    for c_idx in range(N_COLS):
+        ws.column_dimensions[get_column_letter(c_idx + 2)].width = 8
+
+    # Metadata sheet
+    ws_meta = wb.create_sheet("Info")
+    ws_meta.append(["Estimated absorbance (corrected)"])
+    ws_meta.append(["A = -log10(gray_mean / gray_blank) × k"])
+    ws_meta.append(["gray_blank = mean of brightest 10% pixels"])
+    ws_meta.append(["k = 1.0 + 0.5 × (1 - gray_blank/255)^2"])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+
 def inverted_table_html(gray_df: pd.DataFrame) -> str:
     """
     Build an HTML table showing pseudo-absorbance (255 - grayscale) per well.
@@ -694,6 +820,22 @@ def main():
             file_name="microtiter_pseudoabsorbance.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+      # ── Estimated absorbance ───────────────────────────────────────────────
+st.markdown("### 7️⃣ Estimated absorbance (corrected)")
+st.caption("Computed from grayscale using -log10(T) with mobile-camera correction.")
+
+abs_df = build_absorbance(img_orig, grid)
+st.markdown(absorbance_table_html(abs_df), unsafe_allow_html=True)
+
+abs_xlsx = export_absorbance_excel(abs_df)
+st.download_button(
+    label="⬇️ Download absorbance table (Excel)",
+    data=abs_xlsx,
+    file_name="microtiter_absorbance.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
 
         with st.expander("🔬 Mean RGB values per well"):
             for ch_idx, ch_name in enumerate(["R", "G", "B"]):
