@@ -425,7 +425,8 @@ def export_inverted_excel(gray_df: pd.DataFrame) -> bytes:
 
 
 def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
-                     blank_row_idx: int = 0) -> pd.DataFrame:
+                     blank_row_idx: int = 0,
+                     k_override: float = 3.0) -> pd.DataFrame:
     """
     Compute approximate absorbance for each well using a global blank reference.
 
@@ -435,8 +436,11 @@ def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
 
         gray_blank = mean of all blank-row well intensities
         gray_mean  = mean of all pixels in the 11×11 px region of each well
-        k          = 1.0 + 0.5 × (1 - gray_blank / 255)²   (nonlinearity correction)
-        A          = -log10(gray_mean / gray_blank) × k
+        A          = -log10(gray_mean / gray_blank) × k_override
+
+    k_override is a user-supplied correction factor that compensates for smartphone
+    camera gamma and JPEG compression. It can be calibrated as:
+        k = A_expected (from plate reader) / A_raw (from this function with k=1)
 
     Returns a DataFrame (8×12) of absorbance values rounded to 4 decimal places.
     Wells lighter than the blank are set to 0.
@@ -459,14 +463,13 @@ def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
     # Global blank = mean intensity of the selected blank row
     gray_blank = means[blank_row_idx, :].mean()
 
-    # Compute absorbance relative to global blank
-    k      = 1.0 + 0.5 * ((1 - gray_blank / 255) ** 2)
+    # Compute absorbance using user-supplied correction factor
     values = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
             gm = means[r, c]
             if gray_blank > 0 and gm < gray_blank:
-                values[r, c] = -math.log10(gm / gray_blank) * k
+                values[r, c] = -math.log10(gm / gray_blank) * k_override
             else:
                 values[r, c] = 0.0
 
@@ -855,15 +858,28 @@ def main():
         )
         blank_row_idx = ROWS.index(blank_row_label)
 
+        # Correction factor k
+        k_user = st.slider(
+            "Correction factor k",
+            min_value=1.0, max_value=5.0, value=3.0, step=0.1,
+            key="k_correction"
+        )
+        st.caption(
+            f"**k = {k_user:.1f}** — multiplies the raw log value to compensate for smartphone "
+            "camera gamma and JPEG compression. "
+            "To calibrate: if you know the expected absorbance of one well from a plate reader, "
+            "set k = A_expected / A_shown. "
+            "Once calibrated for your phone and lighting conditions, the same k applies to all future measurements."
+        )
+
         st.caption(
             f"Blank reference = mean grayscale intensity of all 12 wells in row **{blank_row_label}**. "
-            "Formula: **A = −log₁₀(gray_mean / gray_blank) × k**, where "
-            "k = 1.0 + 0.5 × (1 − gray_blank/255)² corrects for smartphone gamma nonlinearity. "
+            f"Formula: **A = −log₁₀(gray_mean / gray_blank) × {k_user:.1f}**. "
             "Wells lighter than the blank are set to 0. "
             "Background shade: white ≈ 0, black ≥ 2."
         )
 
-        abs_df = build_absorbance(img_orig, grid, blank_row_idx)
+        abs_df = build_absorbance(img_orig, grid, blank_row_idx, k_user)
         st.markdown(absorbance_table_html(abs_df), unsafe_allow_html=True)
 
         abs_xlsx = export_absorbance_excel(abs_df)
