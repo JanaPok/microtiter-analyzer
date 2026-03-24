@@ -652,6 +652,49 @@ def export_distances_excel(colors, dist_df, ref_rgb) -> bytes:
     return buf.getvalue()
 
 
+# Known correction factors per camera brand (empirical values)
+CAMERA_K = {
+    "apple":   2.8,   # iPhone 13–16 / Air
+    "samsung": 2.4,
+    "google":  3.5,   # Pixel
+    "xiaomi":  2.2,
+    "redmi":   2.2,
+    "huawei":  2.3,
+    "honor":   2.3,
+    "oneplus": 2.5,
+    "oppo":    2.5,
+}
+K_DEFAULT = 3.0   # fallback when brand is unknown or EXIF is missing
+
+
+def k_from_exif(uploaded_file) -> tuple[float, str]:
+    """
+    Read EXIF Make/Model from an uploaded image file and return
+    (k_value, info_string) where info_string describes what was detected.
+    Falls back to K_DEFAULT if EXIF is absent or brand is unrecognised.
+    """
+    try:
+        uploaded_file.seek(0)
+        img_raw = Image.open(uploaded_file)
+        exif    = img_raw._getexif() or {}
+        # EXIF tag 271 = Make, tag 272 = Model
+        make  = str(exif.get(271, "")).strip().lower()
+        model = str(exif.get(272, "")).strip()
+        uploaded_file.seek(0)   # rewind for subsequent PIL.Image.open calls
+
+        if not make:
+            return K_DEFAULT, "No EXIF camera data found — using default k."
+
+        for brand, k_val in CAMERA_K.items():
+            if brand in make:
+                return k_val, f"Detected: **{make.title()} {model}** → k = {k_val}"
+
+        return K_DEFAULT, f"Detected: **{make.title()} {model}** (unknown brand) → using default k = {K_DEFAULT}"
+
+    except Exception:
+        return K_DEFAULT, "Could not read EXIF data — using default k."
+
+
 # ── Main UI ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -695,6 +738,13 @@ def main():
     img_orig  = Image.open(uploaded).convert("RGB")
     img_array = np.array(img_orig)
     OW, OH    = img_orig.width, img_orig.height
+
+    # Read EXIF camera brand and set default k (only on first load of this image)
+    if "exif_k" not in st.session_state:
+        exif_k, exif_msg = k_from_exif(uploaded)
+        st.session_state.exif_k   = exif_k
+        st.session_state.exif_msg = exif_msg
+
     st.success(f"Image loaded: {OW}×{OH} px")
 
     # ── Step 1: Select well A1 ─────────────────────────────────────────────────
@@ -858,18 +908,24 @@ def main():
         )
         blank_row_idx = ROWS.index(blank_row_label)
 
-        # Correction factor k
+        # Correction factor k — default from EXIF camera brand
+        st.info(st.session_state.get("exif_msg", ""))
         k_user = st.slider(
             "Correction factor k",
-            min_value=1.0, max_value=5.0, value=3.0, step=0.1,
+            min_value=1.0, max_value=5.0,
+            value=float(st.session_state.get("exif_k", K_DEFAULT)),
+            step=0.1,
             key="k_correction"
         )
         st.caption(
             f"**k = {k_user:.1f}** — multiplies the raw log value to compensate for smartphone "
             "camera gamma and JPEG compression. "
-            "To calibrate: if you know the expected absorbance of one well from a plate reader, "
-            "set k = A_expected / A_shown. "
-            "Once calibrated for your phone and lighting conditions, the same k applies to all future measurements."
+            "The default value is an **empirical estimate** based on camera brand — "
+            "it is not a scientifically validated constant and may vary between devices, "
+            "firmware versions, and lighting conditions. "
+            "For accurate results, calibrate using at least one well with a known absorbance from a plate reader: "
+            "**k = A_plate_reader / A_shown_here**. "
+            "Once calibrated for your specific device and conditions, the same k can be reused."
         )
 
         st.caption(
@@ -902,7 +958,7 @@ def main():
         st.markdown("---")
         if st.button("🔄 Start over (new image)"):
             for k in ["step","pt_a1","pt_h12","a1_x","a1_y","h12_x","h12_y",
-                      "prev_zoom_a1","prev_zoom_h12"]:
+                      "prev_zoom_a1","prev_zoom_h12","exif_k","exif_msg"]:
                 st.session_state.pop(k, None)
             st.session_state.step = 1
             st.rerun()
