@@ -840,17 +840,31 @@ K_DEFAULT = 3.0   # fallback when brand is unknown or EXIF is missing
 def k_from_exif(uploaded_file) -> tuple[float, str]:
     """
     Read EXIF Make/Model from an uploaded image file and return
-    (k_value, info_string) where info_string describes what was detected.
-    Falls back to K_DEFAULT if EXIF is absent or brand is unrecognised.
+    (k_value, info_string). Falls back to K_DEFAULT if EXIF is absent
+    or brand is unrecognised.
+
+    Reads the file into a BytesIO buffer first to avoid stream position issues
+    with Streamlit's UploadedFile object.
     """
     try:
+        # Read entire file into memory so seek/reopen works reliably
         uploaded_file.seek(0)
-        img_raw = Image.open(uploaded_file)
-        exif    = img_raw._getexif() or {}
-        # EXIF tag 271 = Make, tag 272 = Model
-        make  = str(exif.get(271, "")).strip().lower()
-        model = str(exif.get(272, "")).strip()
-        uploaded_file.seek(0)   # rewind for subsequent PIL.Image.open calls
+        raw_bytes = uploaded_file.read()
+        uploaded_file.seek(0)
+        buf = io.BytesIO(raw_bytes)
+
+        img_raw = Image.open(buf)
+        img_raw.load()   # force full load including EXIF
+
+        # PIL ≥ 9.1: use getexif(); fallback to _getexif() for older versions
+        try:
+            exif_data = img_raw.getexif()          # returns dict-like ExifData
+            make  = str(exif_data.get(271, "")).strip().lower()
+            model = str(exif_data.get(272, "")).strip()
+        except AttributeError:
+            raw_exif = img_raw._getexif() or {}
+            make  = str(raw_exif.get(271, "")).strip().lower()
+            model = str(raw_exif.get(272, "")).strip()
 
         if not make:
             return K_DEFAULT, "No EXIF camera data found — using default k."
@@ -859,10 +873,11 @@ def k_from_exif(uploaded_file) -> tuple[float, str]:
             if brand in make:
                 return k_val, f"Detected: **{make.title()} {model}** → k = {k_val}"
 
-        return K_DEFAULT, f"Detected: **{make.title()} {model}** (unknown brand) → using default k = {K_DEFAULT}"
+        return K_DEFAULT, (f"Detected: **{make.title()} {model}** "
+                           f"(unknown brand) → using default k = {K_DEFAULT}")
 
-    except Exception:
-        return K_DEFAULT, "Could not read EXIF data — using default k."
+    except Exception as e:
+        return K_DEFAULT, f"Could not read EXIF data ({e}) — using default k."
 
 
 # ── Main UI ────────────────────────────────────────────────────────────────────
@@ -905,15 +920,20 @@ def main():
         st.info("Select or photograph the plate using the button above.")
         return
 
-    img_orig  = Image.open(uploaded).convert("RGB")
-    img_array = np.array(img_orig)
-    OW, OH    = img_orig.width, img_orig.height
+    # Read entire file into memory once — avoids stream position issues
+    uploaded.seek(0)
+    file_bytes = uploaded.read()
+    uploaded.seek(0)
 
     # Read EXIF camera brand and set default k (only on first load of this image)
     if "exif_k" not in st.session_state:
-        exif_k, exif_msg = k_from_exif(uploaded)
+        exif_k, exif_msg = k_from_exif(io.BytesIO(file_bytes))
         st.session_state.exif_k   = exif_k
         st.session_state.exif_msg = exif_msg
+
+    img_orig  = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    img_array = np.array(img_orig)
+    OW, OH    = img_orig.width, img_orig.height
 
     st.success(f"Image loaded: {OW}×{OH} px")
 
