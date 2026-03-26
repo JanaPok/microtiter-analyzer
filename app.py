@@ -472,6 +472,37 @@ def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
     )
 
 
+def absorbance_table_html(abs_df: pd.DataFrame) -> str:
+    """
+    Build an HTML table displaying estimated absorbance values (grayscale-based).
+    Higher absorbance = darker background (maps A to a gray shade for visual cue).
+    Values are shown to 4 decimal places.
+    """
+    # Map absorbance to a gray shade: A=0 → white (255), A≥2 → black (0)
+    def a_to_gray(a):
+        return max(0, int(255 * (1 - min(a, 2.0) / 2.0)))
+
+    html  = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+    html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
+    html += "<tr><th style='padding:3px 4px;'></th>"
+    for c in COLS:
+        html += f"<th style='padding:3px 4px;text-align:center;'>{c}</th>"
+    html += "</tr>"
+    for r_idx, row_label in enumerate(ROWS):
+        html += f"<tr><td style='padding:3px 4px;font-weight:bold;'>{row_label}</td>"
+        for c_idx in range(N_COLS):
+            a  = float(abs_df.iloc[r_idx, c_idx])
+            g  = a_to_gray(a)
+            bg = f"rgb({g},{g},{g})"
+            fg = "#000" if g > 128 else "#fff"
+            html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
+                     f"text-align:center;border:1px solid #ccc;min-width:42px;'>"
+                     f"{a:.4f}</td>")
+        html += "</tr>"
+    html += "</table></div>"
+    return html
+
+
 def build_absorbance_channel(img_orig: Image.Image, grid: np.ndarray,
                              blank_row_idx: int = 0,
                              channel: int = 2,
