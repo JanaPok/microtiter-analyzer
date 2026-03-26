@@ -472,7 +472,163 @@ def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
     )
 
 
-def absorbance_table_html(abs_df: pd.DataFrame) -> str:
+def build_absorbance_channel(img_orig: Image.Image, grid: np.ndarray,
+                             blank_row_idx: int = 0,
+                             channel: int = 2,
+                             k_override: float = 1.0) -> pd.DataFrame:
+    """
+    Compute absorbance using a single RGB channel instead of grayscale.
+    This improves sensitivity for dyes with a narrow absorption peak, because
+    only the channel most affected by the dye is used (e.g. Blue for eosin).
+
+        channel: 0 = Red, 1 = Green, 2 = Blue
+        blank_row_idx: row used as blank reference
+        k_override: correction factor (same meaning as in build_absorbance)
+
+    Formula: A = -log10(ch_mean / ch_blank) × k_override
+    """
+    img_array = np.array(img_orig.convert("RGB"), dtype=float)
+    ch_array  = img_array[:, :, channel]
+    h, w      = ch_array.shape
+
+    means = np.zeros((N_ROWS, N_COLS), dtype=float)
+    for r in range(N_ROWS):
+        for c in range(N_COLS):
+            x, y = grid[r, c]
+            x0 = max(0, int(x) - SAMPLE_RADIUS)
+            x1 = min(w, int(x) + SAMPLE_RADIUS + 1)
+            y0 = max(0, int(y) - SAMPLE_RADIUS)
+            y1 = min(h, int(y) + SAMPLE_RADIUS + 1)
+            means[r, c] = ch_array[y0:y1, x0:x1].mean()
+
+    ch_blank = means[blank_row_idx, :].mean()
+
+    values = np.zeros((N_ROWS, N_COLS), dtype=float)
+    for r in range(N_ROWS):
+        for c in range(N_COLS):
+            cm = means[r, c]
+            if ch_blank > 0 and cm < ch_blank:
+                values[r, c] = -math.log10(cm / ch_blank) * k_override
+            else:
+                values[r, c] = 0.0
+
+    return pd.DataFrame(
+        np.round(values, 4),
+        index=ROWS,
+        columns=[str(c) for c in COLS]
+    )
+
+
+# Channel display colours for background tint in table and Excel
+CHANNEL_TINT = {
+    0: (255, 200, 200),   # Red channel → light red tint
+    1: (200, 240, 200),   # Green channel → light green tint
+    2: (200, 210, 255),   # Blue channel → light blue tint
+}
+CHANNEL_NAME = {0: "Red", 1: "Green", 2: "Blue"}
+
+
+def channel_absorbance_table_html(abs_df: pd.DataFrame, channel: int) -> str:
+    """
+    HTML table for single-channel absorbance.
+    Background uses a tinted shade matching the selected channel,
+    darkening with higher absorbance values.
+    """
+    tr, tg, tb = CHANNEL_TINT[channel]
+
+    def cell_bg(a):
+        # Darken the channel tint linearly with absorbance (max at A=2)
+        factor = max(0.0, 1.0 - min(a, 2.0) / 2.0)
+        r = int(tr + (0 - tr) * (1 - factor))
+        g = int(tg + (0 - tg) * (1 - factor))
+        b = int(tb + (0 - tb) * (1 - factor))
+        return f"rgb({r},{g},{b})", 0.299*r + 0.587*g + 0.114*b
+
+    html  = '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+    html += '<table style="border-collapse:collapse;font-size:11px;min-width:480px;">'
+    html += "<tr><th style='padding:3px 4px;'></th>"
+    for c in COLS:
+        html += f"<th style='padding:3px 4px;text-align:center;'>{c}</th>"
+    html += "</tr>"
+    for r_idx, row_label in enumerate(ROWS):
+        html += f"<tr><td style='padding:3px 4px;font-weight:bold;'>{row_label}</td>"
+        for c_idx in range(N_COLS):
+            a        = float(abs_df.iloc[r_idx, c_idx])
+            bg, lum  = cell_bg(a)
+            fg       = "#000" if lum > 128 else "#fff"
+            html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
+                     f"text-align:center;border:1px solid #ccc;min-width:42px;'>"
+                     f"{a:.4f}</td>")
+        html += "</tr>"
+    html += "</table></div>"
+    return html
+
+
+def export_channel_absorbance_excel(abs_df: pd.DataFrame, channel: int,
+                                    blank_row_label: str, k: float) -> bytes:
+    """
+    Excel export for single-channel absorbance.
+    Cell background uses a tinted shade matching the channel.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"{CHANNEL_NAME[channel]} channel absorbance"
+
+    thin   = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    tr, tg, tb = CHANNEL_TINT[channel]
+
+    def a_to_hex(a):
+        factor = max(0.0, 1.0 - min(a, 2.0) / 2.0)
+        r = int(tr + (0 - tr) * (1 - factor))
+        g = int(tg + (0 - tg) * (1 - factor))
+        b = int(tb + (0 - tb) * (1 - factor))
+        return f"{r:02X}{g:02X}{b:02X}"
+
+    # Column headers
+    ws.cell(row=1, column=1, value="")
+    for c_idx, c_label in enumerate(COLS):
+        cell           = ws.cell(row=1, column=c_idx + 2, value=c_label)
+        cell.font      = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        cell.border    = border
+
+    # Data rows
+    for r_idx, row_label in enumerate(ROWS):
+        hdr            = ws.cell(row=r_idx + 2, column=1, value=row_label)
+        hdr.font       = Font(bold=True)
+        hdr.alignment  = Alignment(horizontal="center")
+        hdr.border     = border
+
+        for c_idx in range(N_COLS):
+            a    = float(abs_df.iloc[r_idx, c_idx])
+            cell = ws.cell(row=r_idx + 2, column=c_idx + 2, value=round(a, 4))
+            hex_col       = a_to_hex(a)
+            cell.fill     = PatternFill("solid", fgColor=hex_col)
+            r2, g2, b2    = int(hex_col[0:2],16), int(hex_col[2:4],16), int(hex_col[4:6],16)
+            lum           = 0.299*r2 + 0.587*g2 + 0.114*b2
+            cell.font     = Font(color="000000" if lum > 128 else "FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+            cell.border   = border
+
+    ws.column_dimensions["A"].width = 5
+    for c_idx in range(N_COLS):
+        ws.column_dimensions[get_column_letter(c_idx + 2)].width = 9
+
+    ws_meta = wb.create_sheet("Info")
+    ws_meta.append([f"Microtiter Plate Analyzer — {CHANNEL_NAME[channel]} channel absorbance"])
+    ws_meta.append([f"Channel used: {CHANNEL_NAME[channel]} (0=R, 1=G, 2=B)"])
+    ws_meta.append([f"Blank reference row: {blank_row_label}"])
+    ws_meta.append([f"Correction factor k: {k}"])
+    ws_meta.append(["Formula: A = -log10(ch_mean / ch_blank) × k"])
+    ws_meta.append(["Using a single channel improves sensitivity for dyes with narrow absorption peaks."])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+
     """
     Build an HTML table displaying estimated absorbance values.
     Higher absorbance = darker background (maps A to a gray shade for visual cue).
@@ -637,7 +793,7 @@ def export_distances_excel(colors, dist_df, ref_rgb) -> bytes:
 
 # Known correction factors per camera brand (empirical values)
 CAMERA_K = {
-    "apple":   3,   # iPhone 13–16 / Air
+    "apple":   2.8,   # iPhone 13–16 / Air
     "samsung": 2.4,
     "google":  3.5,   # Pixel
     "xiaomi":  2.2,
@@ -926,6 +1082,47 @@ def main():
             label="⬇️ Download absorbance table (Excel)",
             data=abs_xlsx,
             file_name="microtiter_absorbance.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        # ── Single-channel absorbance table ───────────────────────────────────
+        st.markdown("### 8️⃣ Single-channel absorbance per well")
+        st.caption(
+            "Uses only one RGB channel instead of grayscale. "
+            "This improves accuracy for dyes with a narrow absorption peak — "
+            "choose the channel most sensitive to your dye: "
+            "**Blue** for red/pink dyes (e.g. eosin, phenol red), "
+            "**Red** for blue/purple dyes (e.g. crystal violet, coomassie), "
+            "**Green** for red or violet dyes. "
+            "Same blank row and k as above apply."
+        )
+
+        ch_label = st.selectbox(
+            "RGB channel for absorbance calculation",
+            options=["Red (0)", "Green (1)", "Blue (2)"],
+            index=2,    # default: Blue
+            key="abs_channel"
+        )
+        ch_idx = ["Red (0)", "Green (1)", "Blue (2)"].index(ch_label)
+
+        ch_abs_df = build_absorbance_channel(
+            img_orig, grid, blank_row_idx, ch_idx, k_user
+        )
+        st.markdown(channel_absorbance_table_html(ch_abs_df, ch_idx),
+                    unsafe_allow_html=True)
+        st.caption(
+            f"Formula: **A = −log₁₀(ch_mean / ch_blank) × {k_user:.1f}** "
+            f"using the **{CHANNEL_NAME[ch_idx]}** channel. "
+            "Blank = mean of selected blank row in this channel."
+        )
+
+        ch_xlsx = export_channel_absorbance_excel(
+            ch_abs_df, ch_idx, blank_row_label, k_user
+        )
+        st.download_button(
+            label=f"⬇️ Download {CHANNEL_NAME[ch_idx]}-channel absorbance (Excel)",
+            data=ch_xlsx,
+            file_name=f"microtiter_absorbance_{CHANNEL_NAME[ch_idx].lower()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
