@@ -74,20 +74,19 @@ def euclidean(c1, c2):
     return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(c1, c2)))
 
 
-def build_results(img_array, grid):
+def build_results(img_array, grid, ref_row_idx: int = 0):
     """
     Sample colors at all 96 well positions and compute Euclidean RGB distances
-    relative to a single reference vector derived from row A.
+    relative to a single reference vector derived from a user-selected reference row.
 
-    The reference is the mean RGB vector of all 12 wells in row A, where each
-    well is weighted by its perceptual luminance (ITU-R BT.601):
+    The reference is the luminance-weighted mean RGB vector of all 12 wells in the
+    selected reference row:
         L = 0.299·R + 0.587·G + 0.114·B
-    Wells with higher luminance contribute more to the reference, reflecting
-    the fact that brighter, more saturated wells carry more colorimetric signal.
+    Wells with higher luminance contribute more to the reference.
 
     Returns:
         colors   : ndarray of shape (8, 12, 3) with mean RGB per well
-        dist_df  : DataFrame (8×12) of Euclidean distances from the row-A reference
+        dist_df  : DataFrame (8×12) of Euclidean distances from the reference
         ref_rgb  : 1-D array (3,) — the reference RGB vector used
     """
     colors = np.zeros((N_ROWS, N_COLS, 3), dtype=float)
@@ -95,13 +94,13 @@ def build_results(img_array, grid):
         for c in range(N_COLS):
             colors[r, c] = sample_color(img_array, *grid[r, c])
 
-    # Compute perceptual luminance weights for row A wells
-    row_a   = colors[0, :, :]                                      # shape (12, 3)
-    lum_a   = 0.299*row_a[:, 0] + 0.587*row_a[:, 1] + 0.114*row_a[:, 2]  # shape (12,)
-    weights = lum_a / lum_a.sum() if lum_a.sum() > 0 else np.ones(N_COLS) / N_COLS
-    ref_rgb = (row_a * weights[:, np.newaxis]).sum(axis=0)         # weighted mean RGB
+    # Compute perceptual luminance weights for the selected reference row
+    row_ref = colors[ref_row_idx, :, :]                                        # shape (12, 3)
+    lum_ref = 0.299*row_ref[:, 0] + 0.587*row_ref[:, 1] + 0.114*row_ref[:, 2]
+    weights  = lum_ref / lum_ref.sum() if lum_ref.sum() > 0 else np.ones(N_COLS) / N_COLS
+    ref_rgb  = (row_ref * weights[:, np.newaxis]).sum(axis=0)                  # weighted mean RGB
 
-    # Euclidean distance of every well from the single row-A reference
+    # Euclidean distance of every well from the reference
     distances = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
@@ -180,21 +179,21 @@ def zoom_crop(img: Image.Image, cx: int, cy: int, zoom: int) -> tuple:
     return zoomed, ox, oy
 
 
-def color_table_html(colors, dist_df, ref_rgb) -> str:
+def color_table_html(colors, dist_df, ref_rgb, ref_row_label: str = "A") -> str:
     """
     Build an HTML table where each cell background reflects the actual well color.
-    Cell value = Euclidean RGB distance from the single row-A reference vector.
-    Row A is highlighted with a red border to mark it as the reference row.
+    Cell value = Euclidean RGB distance from the luminance-weighted reference row mean.
+    The reference row is highlighted with a red border.
     """
-    # Reference colour swatch for display
+    ref_row_idx = ROWS.index(ref_row_label) if ref_row_label in ROWS else 0
+
+    # Reference colour swatch
     r_ref, g_ref, b_ref = ref_rgb.astype(int)
-    lum_ref = 0.299*r_ref + 0.587*g_ref + 0.114*b_ref
-    fg_ref  = "#000" if lum_ref > 128 else "#fff"
     ref_swatch = (
         f"<div style='display:inline-block;width:18px;height:18px;border-radius:3px;"
         f"background:rgb({r_ref},{g_ref},{b_ref});border:1px solid #999;"
         f"vertical-align:middle;margin-right:5px;'></div>"
-        f"<span style='font-size:11px;'>Reference (row A mean): "
+        f"<span style='font-size:11px;'>Reference (row {ref_row_label} mean): "
         f"R={r_ref} G={g_ref} B={b_ref}</span>"
     )
 
@@ -213,7 +212,7 @@ def color_table_html(colors, dist_df, ref_rgb) -> str:
             bg     = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
             lum    = 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]
             fg     = "#000" if lum > 128 else "#fff"
-            border = "2px solid #e00" if r_idx == 0 else "1px solid #ccc"
+            border = "2px solid #e00" if r_idx == ref_row_idx else "1px solid #ccc"
             html += (f"<td style='background:{bg};color:{fg};padding:4px 3px;"
                      f"text-align:center;border:{border};min-width:36px;'>"
                      f"{dist:.1f}</td>")
@@ -1238,12 +1237,26 @@ def main():
                  caption="Yellow = row A  |  Cyan = other rows  |  Red = A1  |  Green = H12",
                  use_container_width=True)
 
-        colors, dist_df, ref_rgb = build_results(img_array, grid)
+        colors_raw, _, _ = build_results(img_array, grid)  # sample colors once
 
-        st.markdown("### 4️⃣ Euclidean distances from row A reference")
-        st.markdown(color_table_html(colors, dist_df, ref_rgb), unsafe_allow_html=True)
-        st.caption("Each cell = Euclidean RGB distance from the luminance-weighted mean RGB of row A (all 12 wells). "
-                   "Row A border = reference row.")
+        # ── Section 4: Euclidean distances ────────────────────────────────────
+        st.markdown("### 4️⃣ Euclidean distances from reference row")
+
+        ref_row_label_dist = st.selectbox(
+            "Reference row for Euclidean distances",
+            options=ROWS, index=0, key="ref_row_dist"
+        )
+        ref_row_idx_dist = ROWS.index(ref_row_label_dist)
+
+        colors, dist_df, ref_rgb = build_results(img_array, grid, ref_row_idx_dist)
+
+        st.markdown(color_table_html(colors, dist_df, ref_rgb, ref_row_label_dist),
+                    unsafe_allow_html=True)
+        st.caption(
+            f"Each cell = Euclidean RGB distance from the luminance-weighted mean RGB "
+            f"of row **{ref_row_label_dist}** (all 12 wells). "
+            f"Row {ref_row_label_dist} is highlighted with a red border."
+        )
 
         dist_xlsx = export_distances_excel(colors, dist_df, ref_rgb)
         st.download_button(
@@ -1253,28 +1266,11 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # ── Grayscale intensity table ──────────────────────────────────────────
-        st.markdown("### 5️⃣ Grayscale intensity per well")
-        st.caption("The image is converted to grayscale (ITU-R BT.601). "
-                   "Each value is the mean pixel intensity (0 = black, 255 = white) "
-                   "sampled from an 11×11 px region centred on the well.")
-
+        # ── Section 5: Pseudo-absorbance (255 − grayscale) ────────────────────
         gray_df = build_grayscale(img_orig, grid)
-        st.markdown(grayscale_table_html(gray_df), unsafe_allow_html=True)
 
-        xlsx_bytes = export_grayscale_excel(gray_df, img_orig, grid)
-        st.download_button(
-            label="⬇️ Download grayscale table (Excel)",
-            data=xlsx_bytes,
-            file_name="microtiter_grayscale.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-        # ── Pseudo-absorbance table (255 − grayscale) ─────────────────────────
-        st.markdown("### 6️⃣ Pseudo-absorbance per well (255 − grayscale)")
-        st.caption("Inverted grayscale: higher value = darker well = stronger colorimetric reaction. "
-                   "Approximates the concept of absorbance measured by a plate reader.")
-
+        st.markdown("### 5️⃣ Pseudo-absorbance per well (255 − grayscale)")
+        st.caption("Inverted grayscale: higher value = darker well = stronger colorimetric reaction.")
         st.markdown(inverted_table_html(gray_df), unsafe_allow_html=True)
 
         inv_xlsx_bytes = export_inverted_excel(gray_df)
@@ -1285,26 +1281,21 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # ── Estimated absorbance table ─────────────────────────────────────────
-        st.markdown("### 7️⃣ Estimated absorbance per well")
+        # ── Section 6: Estimated absorbance (grayscale-based) ─────────────────
+        st.markdown("### 6️⃣ Estimated absorbance per well")
 
-        # Blank row selector
         blank_row_label = st.selectbox(
             "Blank row (lightest row = unabsorbed light reference)",
-            options=ROWS,
-            index=0,
-            key="blank_row"
+            options=ROWS, index=0, key="blank_row"
         )
         blank_row_idx = ROWS.index(blank_row_label)
 
-        # Correction factor k — default from EXIF camera brand
         st.info(st.session_state.get("exif_msg", ""))
         k_user = st.slider(
             "Correction factor k",
             min_value=1.0, max_value=5.0,
             value=float(st.session_state.get("exif_k", K_DEFAULT)),
-            step=0.1,
-            key="k_correction"
+            step=0.1, key="k_correction"
         )
         st.caption(
             f"**k = {k_user:.1f}** — multiplies the raw log value to compensate for smartphone "
@@ -1312,16 +1303,12 @@ def main():
             "The default value is an **empirical estimate** based on camera brand — "
             "it is not a scientifically validated constant and may vary between devices, "
             "firmware versions, and lighting conditions. "
-            "For accurate results, calibrate using at least one well with a known absorbance from a plate reader: "
-            "**k = A_plate_reader / A_shown_here**. "
-            "Once calibrated for your specific device and conditions, the same k can be reused."
+            "For accurate results, calibrate: **k = A_plate_reader / A_shown_here**."
         )
-
         st.caption(
             f"Blank reference = mean grayscale intensity of all 12 wells in row **{blank_row_label}**. "
             f"Formula: **A = −log₁₀(gray_mean / gray_blank) × {k_user:.1f}**. "
-            "Wells lighter than the blank are set to 0. "
-            "Background shade: white ≈ 0, black ≥ 2."
+            "Wells lighter than the blank are set to 0. Background shade: white ≈ 0, black ≥ 2."
         )
 
         abs_df = build_absorbance(img_orig, grid, blank_row_idx, k_user)
@@ -1335,77 +1322,16 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # ── Single-channel absorbance table ───────────────────────────────────
-        st.markdown("### 8️⃣ Single-channel absorbance per well")
-        st.caption(
-            "Uses only one RGB channel instead of grayscale. "
-            "This improves accuracy for dyes with a narrow absorption peak — "
-            "choose the channel most sensitive to your dye: "
-            "**Blue** for red/pink dyes (e.g. eosin, phenol red), "
-            "**Red** for blue/purple dyes (e.g. crystal violet, coomassie), "
-            "**Green** for red or violet dyes. "
-            "Same blank row and k as above apply."
-        )
-
-        ch_label = st.selectbox(
-            "RGB channel for absorbance calculation",
-            options=["Red (0)", "Green (1)", "Blue (2)"],
-            index=2,    # default: Blue
-            key="abs_channel"
-        )
-        ch_idx = ["Red (0)", "Green (1)", "Blue (2)"].index(ch_label)
-
-        ch_abs_df = build_absorbance_channel(
-            img_orig, grid, blank_row_idx, ch_idx, k_user
-        )
-        st.markdown(channel_absorbance_table_html(ch_abs_df, ch_idx),
-                    unsafe_allow_html=True)
-        st.caption(
-            f"Formula: **A = −log₁₀(ch_mean / ch_blank) × {k_user:.1f}** "
-            f"using the **{CHANNEL_NAME[ch_idx]}** channel. "
-            "Blank = mean of selected blank row in this channel."
-        )
-
-        ch_xlsx = export_channel_absorbance_excel(
-            ch_abs_df, ch_idx, blank_row_label, k_user
-        )
-        st.download_button(
-            label=f"⬇️ Download {CHANNEL_NAME[ch_idx]}-channel absorbance (Excel)",
-            data=ch_xlsx,
-            file_name=f"microtiter_absorbance_{CHANNEL_NAME[ch_idx].lower()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-        # ── Weighted-channel absorbance + optional calibration ────────────────
-        st.markdown("### 9️⃣ Dye-optimised absorbance (gamma-corrected weighted channels)")
+        # ── Section 7: Gamma-corrected absorbance + calibration ───────────────
+        st.markdown("### 7️⃣ Gamma-corrected absorbance with optional calibration")
         st.caption(
             "Applies sRGB gamma correction (γ = 2.2) to linearise pixel values before "
-            "computing transmittance — this is the main source of systematic underestimation "
-            "in sections 7 and 8. Then uses a weighted combination of R, G, B channels "
-            "tuned to the dye's absorption spectrum. Optionally apply a linear calibration "
-            "using wells with known plate-reader absorbance values."
+            "computing transmittance, then uses a weighted combination of R, G, B channels. "
+            "Optionally apply a linear calibration using wells with known plate-reader values."
         )
 
-        # ── Dye selector ──────────────────────────────────────────────────────
-        dye_name = st.selectbox("Select dye", options=list(DYES.keys()),
-                                key="dye_select")
-        lam_max, w_r, w_g, w_b = DYES[dye_name]
-
-        if dye_name == "Custom wavelength":
-            lam_custom = st.number_input(
-                "Absorption peak wavelength (nm)", min_value=380, max_value=780,
-                value=500, step=5, key="lam_custom"
-            )
-            w_r, w_g, w_b = weights_from_lambda(lam_custom)
-            lam_max = lam_custom
-
-        st.caption(
-            f"Channel weights: **R = {w_r}  G = {w_g}  B = {w_b}**"
-            + (f" (estimated from λ = {lam_max} nm)" if lam_max else "") +
-            ". Blank row is shared with section 7️⃣."
-        )
-
-        # Compute gamma-corrected weighted absorbance (k=1.0, no extra scaling)
+        # Fixed equal channel weights (dye selection removed per analysis conclusions)
+        w_r, w_g, w_b = 1/3, 1/3, 1/3
         wabs_df = build_absorbance_weighted(
             img_orig, grid, blank_row_idx, w_r, w_g, w_b, gamma=2.2
         )
@@ -1413,10 +1339,9 @@ def main():
         # ── Optional calibration ──────────────────────────────────────────────
         with st.expander("🔧 Optional: linear calibration with plate-reader values"):
             st.caption(
-                "Select wells whose absorbance you measured on a plate reader "
-                "(use non-blank wells only — blank row is always 0 and cannot be used). "
-                "The app fits **A_cal = slope × A_raw + intercept** and applies it to all wells. "
-                "Minimum 2 points required."
+                "Select 2–4 wells whose absorbance you measured on a plate reader "
+                "(non-blank wells only — the blank row is always 0 by definition). "
+                "The app fits **A_cal = slope × A_raw + intercept** and applies it to all wells."
             )
             n_cal = st.selectbox("Number of calibration points", [0, 2, 3, 4],
                                  key="n_cal")
@@ -1425,25 +1350,25 @@ def main():
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     row_lbl = st.selectbox(
-                        f"Point {i+1} row",
+                        f"Point {i+1} — row",
                         options=[r for r in ROWS if r != blank_row_label],
                         key=f"cal_row_{i}"
                     )
                 with c2:
                     col_num = st.number_input(
-                        f"Point {i+1} column", min_value=1, max_value=12,
-                        value=1, step=1, key=f"cal_col_{i}"
+                        f"Point {i+1} — column",
+                        min_value=1, max_value=12, value=1, step=1,
+                        key=f"cal_col_{i}"
                     )
                 with c3:
                     a_ref = st.number_input(
-                        f"Point {i+1} A (plate reader)",
+                        f"Point {i+1} — A (plate reader)",
                         min_value=0.0, max_value=5.0, value=0.0,
                         step=0.001, format="%.4f", key=f"cal_ref_{i}"
                     )
                 if a_ref > 0:
                     cal_wells.append((row_lbl, int(col_num), a_ref))
 
-        # Apply calibration
         cal_info = ""
         if len(cal_wells) >= 2:
             final_df, slope, intercept = apply_calibration(wabs_df, cal_wells)
@@ -1460,26 +1385,22 @@ def main():
         st.markdown(weighted_absorbance_table_html(final_df, w_r, w_g, w_b),
                     unsafe_allow_html=True)
         if slope is not None:
-            st.caption(
-                f"Calibrated. **{cal_info}** "
-                f"(weights R={w_r} G={w_g} B={w_b}, γ=2.2)"
-            )
+            st.caption(f"Calibrated. **{cal_info}** (γ = 2.2, equal channel weights)")
         else:
             st.caption(
-                f"Uncalibrated. Formula: **A = −log₁₀(T_eff)**, "
-                f"T_eff = weighted gamma-corrected transmittance "
-                f"(R={w_r}, G={w_g}, B={w_b}). "
+                "Uncalibrated. Formula: **A = −log₁₀(T_eff)**, "
+                "T_eff = gamma-corrected mean transmittance (equal R/G/B weights). "
                 "Enter calibration points above for improved accuracy."
             )
 
         wabs_xlsx = export_weighted_excel(
-            final_df, dye_name, w_r, w_g, w_b,
+            final_df, "gamma-corrected equal weights", w_r, w_g, w_b,
             blank_row_label, 2.2, cal_info
         )
         st.download_button(
-            label="⬇️ Download dye-optimised absorbance (Excel)",
+            label="⬇️ Download gamma-corrected absorbance (Excel)",
             data=wabs_xlsx,
-            file_name="microtiter_absorbance_weighted.xlsx",
+            file_name="microtiter_absorbance_gamma.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
