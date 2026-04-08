@@ -1,6 +1,6 @@
-# MTT assay analyzer
+# MTT Assay Analyzer
 
-A mobile-friendly, hardware-free web application for quantitative colorimetric analysis of 96-well plates using an ordinary smartphone photograph.
+A mobile-friendly, hardware-free web application for quantitative colorimetric analysis of MTT assay 96-well plates using an ordinary smartphone photograph.
 
 > **No plate reader required.** Upload a photo, align two wells, and receive a full suite of colorimetric outputs — directly in your browser on any device.
 
@@ -8,9 +8,9 @@ A mobile-friendly, hardware-free web application for quantitative colorimetric a
 
 ## Overview
 
-MTT assay analyzer imitates conventinal spectrophotometer with a smartphone camera and a web browser. The user photographs the plate, marks two reference wells (A1 and H12), and the application automatically detects all 96 well positions and computes multiple colorimetric metrics, including an estimated absorbance value.
+Quantitative analysis of MTT assay 96-well plates conventionally requires a dedicated plate reader spectrophotometer — an instrument costing USD 10,000–50,000. MTT Assay Analyzer replaces this hardware with a smartphone camera and a web browser. The user photographs the plate, marks two reference wells (A1 and H12), and the application automatically detects all 96 well positions and computes multiple colorimetric metrics, including an estimated absorbance value.
 
-The application is built with [Streamlit](https://mic-ana.streamlit.app), runs fully in-browser with no installation on the user's device, and works on iOS, Android, and desktop.
+The application is built with [Streamlit](https://streamlit.io), runs fully in-browser with no installation on the user's device, and works on iOS, Android, and desktop.
 
 ---
 
@@ -94,8 +94,8 @@ A        = −log₁₀(T_eff)
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/Pokornz/microtiter_analyzer.git
-cd microtiter_analyzer
+git clone https://github.com/Pokornz/mtt_assay_analyzer.git
+cd mtt_assay_analyzer
 
 # 2. Install dependencies
 pip install streamlit pillow numpy pandas openpyxl
@@ -134,7 +134,7 @@ The app is deployed on Streamlit Cloud — no installation needed:
 
 ## Limitations
 
-- Results depend on **illumination quality**. Uniform, diffuse bottom lighting is strongly recommended. Avoid direct sunlight, shadows cast by the camera, and strong reflections from the plate lid.
+- Results depend on **illumination quality**. Uniform, diffuse overhead lighting is strongly recommended. Avoid direct sunlight, shadows cast by the camera, and strong reflections from the plate lid.
 - The method captures **broadband RGB light**, not monochromatic light at the dye's absorption peak. This introduces a systematic underestimation of absorbance that is partially corrected by gamma correction and channel weighting, but cannot be fully eliminated without a bandpass filter or calibration.
 - **Gamma and EXIF correction factors** are empirical estimates based on camera brand. They may vary between firmware versions and shooting conditions. For quantitative results, always calibrate against at least two plate-reader reference values.
 - **Well detection** relies on manual alignment of two corner wells. Plates that are significantly rotated or perspective-distorted may produce less accurate grids. Photograph the plate as flat-on as possible.
@@ -156,13 +156,18 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 ## Citation
 
-If you use MTT assay analyzer in your research, please cite:
+If you use MTT Assay Analyzer in your research, please cite:
 
-Pokorna, J. (2026). microtiter_analyzer (Version 1.0) [Software]. Zenodo. https://doi.org/10.5281/zenodo.19467293
+```
+Pokornz. (2025). MTT Assay Analyzer (Version 1.0) [Software].
+GitHub. https://github.com/Pokornz/mtt_assay_analyzer
+```
+
+*A formal citation with DOI will be added upon publication.*
 
 ---
 
 ## Author
 
-Developed by Jana Pokorna, Masaryk University, Brno, 2026.  
-Contact: jana.pokorna@med.muni.cz
+Developed by **[your name]**, [your institution], [year].  
+Contact: [your email or GitHub profile]

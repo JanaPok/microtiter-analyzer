@@ -1,7 +1,7 @@
 """
-Microtiter Plate Analyzer
+MTT Assay Analyzer
 =========================
-Mobile-friendly web application for colorimetric analysis of 96-well microtiter plates.
+Mobile-friendly web application for quantitative colorimetric analysis of MTT assay 96-well plates.
 
 The user photographs a plate, marks two reference wells (A1 and H12), and receives:
   1. A table of Euclidean RGB distances relative to row A (per column).
@@ -323,7 +323,7 @@ def export_grayscale_excel(gray_df: pd.DataFrame, img_orig: Image.Image,
 
     # ── Metadata sheet ─────────────────────────────────────────────────────────
     ws_meta = wb.create_sheet("Info")
-    ws_meta.append(["Microtiter Plate Analyzer — grayscale export"])
+    ws_meta.append(["MTT Assay Analyzer — grayscale export"])
     ws_meta.append(["Values represent mean grayscale intensity (0=black, 255=white)"])
     ws_meta.append(["Sampling region: 11×11 px centred on each well"])
     ws_meta.append(["Grayscale conversion: ITU-R BT.601 (PIL Image.convert('L'))"])
@@ -405,7 +405,7 @@ def export_inverted_excel(gray_df: pd.DataFrame) -> bytes:
 
     # Metadata sheet
     ws_meta = wb.create_sheet("Info")
-    ws_meta.append(["Microtiter Plate Analyzer — pseudo-absorbance export"])
+    ws_meta.append(["MTT Assay Analyzer — pseudo-absorbance export"])
     ws_meta.append(["Values = 255 - grayscale intensity (0=white/no reaction, 255=black/full reaction)"])
     ws_meta.append(["Higher value = darker well = stronger colorimetric reaction"])
     ws_meta.append(["Grayscale conversion: ITU-R BT.601 (PIL Image.convert('L'))"])
@@ -646,7 +646,7 @@ def export_channel_absorbance_excel(abs_df: pd.DataFrame, channel: int,
         ws.column_dimensions[get_column_letter(c_idx + 2)].width = 9
 
     ws_meta = wb.create_sheet("Info")
-    ws_meta.append([f"Microtiter Plate Analyzer — {CHANNEL_NAME[channel]} channel absorbance"])
+    ws_meta.append([f"MTT Assay Analyzer — {CHANNEL_NAME[channel]} channel absorbance"])
     ws_meta.append([f"Channel used: {CHANNEL_NAME[channel]} (0=R, 1=G, 2=B)"])
     ws_meta.append([f"Blank reference row: {blank_row_label}"])
     ws_meta.append([f"Correction factor k: {k}"])
@@ -740,7 +740,7 @@ def export_absorbance_excel(abs_df: pd.DataFrame) -> bytes:
 
     # Metadata sheet
     ws_meta = wb.create_sheet("Info")
-    ws_meta.append(["Microtiter Plate Analyzer — estimated absorbance export"])
+    ws_meta.append(["MTT Assay Analyzer — estimated absorbance export"])
     ws_meta.append(["Blank reference = mean grayscale intensity of all 12 row-A wells"])
     ws_meta.append(["gray_mean = mean of all pixels in the 11×11 px well region"])
     ws_meta.append(["k = 1.0 + 0.5 × (1 - gray_blank/255)²  (smartphone gamma correction)"])
@@ -810,7 +810,7 @@ def export_distances_excel(colors, dist_df, ref_rgb) -> bytes:
     # ── Metadata sheet ─────────────────────────────────────────────────────────
     r_ref, g_ref, b_ref = ref_rgb.astype(int)
     ws_meta = wb.create_sheet("Info")
-    ws_meta.append(["Microtiter Plate Analyzer — Euclidean distance export"])
+    ws_meta.append(["MTT Assay Analyzer — Euclidean distance export"])
     ws_meta.append(["Reference = luminance-weighted mean RGB of all 12 row-A wells"])
     ws_meta.append([f"Reference RGB: R={r_ref}  G={g_ref}  B={b_ref}"])
     ws_meta.append(["Distance = sqrt((R1-R2)² + (G1-G2)² + (B1-B2)²)"])
@@ -1063,7 +1063,7 @@ def export_weighted_excel(abs_df: pd.DataFrame, dye_name: str,
         ws.column_dimensions[get_column_letter(c_idx+2)].width = 9
 
     ws_meta = wb.create_sheet("Info")
-    ws_meta.append(["Microtiter Plate Analyzer — gamma-corrected weighted absorbance"])
+    ws_meta.append(["MTT Assay Analyzer — gamma-corrected weighted absorbance"])
     ws_meta.append([f"Dye: {dye_name}"])
     ws_meta.append([f"Channel weights: R={w_r}  G={w_g}  B={w_b}"])
     ws_meta.append([f"Blank reference row: {blank_row_label}"])
@@ -1082,7 +1082,7 @@ def export_weighted_excel(abs_df: pd.DataFrame, dye_name: str,
 
 def main():
     st.set_page_config(
-        page_title="Microtiter Analyzer",
+        page_title="MTT Assay Analyzer",
         page_icon="🧪",
         layout="centered",
         initial_sidebar_state="collapsed"
@@ -1102,7 +1102,7 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("🧪 Microtiter Analyzer")
+    st.title("🧪 MTT Assay Analyzer")
 
     # ── Session state initialisation ───────────────────────────────────────────
     defaults = {"step": 1, "pt_a1": None, "pt_h12": None}
@@ -1262,7 +1262,7 @@ def main():
         st.download_button(
             label="⬇️ Download distances table (Excel)",
             data=dist_xlsx,
-            file_name="microtiter_distances.xlsx",
+            file_name="mtt_distances.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -1277,7 +1277,7 @@ def main():
         st.download_button(
             label="⬇️ Download pseudo-absorbance table (Excel)",
             data=inv_xlsx_bytes,
-            file_name="microtiter_pseudoabsorbance.xlsx",
+            file_name="mtt_pseudoabsorbance.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -1318,7 +1318,7 @@ def main():
         st.download_button(
             label="⬇️ Download absorbance table (Excel)",
             data=abs_xlsx,
-            file_name="microtiter_absorbance.xlsx",
+            file_name="mtt_absorbance.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -1400,7 +1400,7 @@ def main():
         st.download_button(
             label="⬇️ Download gamma-corrected absorbance (Excel)",
             data=wabs_xlsx,
-            file_name="microtiter_absorbance_gamma.xlsx",
+            file_name="mtt_absorbance_gamma.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -1425,7 +1425,7 @@ def main():
     st.markdown(
         "<div style='margin-top:2.5rem;padding-top:0.6rem;border-top:1px solid #e0e0e0;"
         "text-align:center;color:#aaaaaa;font-size:11px;'>"
-        "Developed by Jana Pokorná &nbsp;·&nbsp; Masaryk University, Brno &nbsp;·&nbsp; 2026"
+        "Developed by Jana Pokorná &nbsp;·&nbsp; Brno &nbsp;·&nbsp; 2026"
         "</div>",
         unsafe_allow_html=True
     )
