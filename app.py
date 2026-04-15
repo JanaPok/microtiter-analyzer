@@ -971,7 +971,7 @@ def export_weighted_excel(abs_df: pd.DataFrame, dye_name: str,
 
 def main():
     st.set_page_config(
-        page_title="MTT Assay Analyzer",
+        page_title="MTT Assay Analyzer 123",
         page_icon="🧪",
         layout="centered",
         initial_sidebar_state="collapsed"
