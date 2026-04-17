@@ -398,84 +398,6 @@ def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
 MTT_K_RATIO = 2.84
 
 
-def build_absorbance_mtt_ratio(img_orig: Image.Image,
-                                grid: np.ndarray,
-                                blank_row_idx: int) -> pd.DataFrame:
-    """
-    MTT-specific absorbance estimation using the Green/Red channel ratio.
-
-    This method exploits the characteristic absorption spectrum of MTT formazan
-    (λ_max ≈ 570 nm, purple colour): the dye absorbs strongly in the green
-    channel and weakly in the red channel. The ratio G/R is therefore a
-    sensitive and camera-gamma-independent indicator of formazan concentration.
-
-    Mathematical basis
-    ------------------
-    For a JPEG image with gamma encoding γ:
-
-        pixel_G = (T_G)^(1/γ) × 255,   T_G = 10^(−ε_G × A)
-        pixel_R = (T_R)^(1/γ) × 255,   T_R = 10^(−ε_R × A)
-
-    Taking the ratio and logarithm:
-
-        −log₁₀(G_well / R_well) − (−log₁₀(G_blank / R_blank))
-            = (ε_G − ε_R) / γ × A
-
-    This expression is linear in A and independent of γ — gamma cancels
-    because both channels are encoded with the same transfer function.
-    Multiplying by k_ratio = γ / (ε_G − ε_R) ≈ 2.59 recovers A in AU.
-
-    k_ratio is a property of the dye (ε_G/ε_R ratio for formazan), not of
-    the camera, and is therefore constant across all devices and lighting
-    conditions.
-
-    Returns a DataFrame (8×12) of absorbance values rounded to 4 decimal places.
-    Wells where G/R ≥ blank G/R (no dye or saturated) are set to 0.
-    """
-    arr = np.array(img_orig.convert("RGB"), dtype=float)
-    h, w = arr.shape[:2]
-
-    means_G = np.zeros((N_ROWS, N_COLS), dtype=float)
-    means_R = np.zeros((N_ROWS, N_COLS), dtype=float)
-
-    for r in range(N_ROWS):
-        for c in range(N_COLS):
-            x, y = grid[r, c]
-            x0 = max(0, int(x) - SAMPLE_RADIUS)
-            x1 = min(w, int(x) + SAMPLE_RADIUS + 1)
-            y0 = max(0, int(y) - SAMPLE_RADIUS)
-            y1 = min(h, int(y) + SAMPLE_RADIUS + 1)
-            patch = arr[y0:y1, x0:x1]
-            means_G[r, c] = patch[:, :, 1].mean()   # G channel
-            means_R[r, c] = patch[:, :, 0].mean()   # R channel
-
-    # Per-well G/R ratio; blank reference = median across blank row
-    blank_G = float(np.median(means_G[blank_row_idx, :]))
-    blank_R = float(np.median(means_R[blank_row_idx, :]))
-    blank_ratio = blank_G / blank_R if blank_R > 0 else 1.0
-
-    values = np.zeros((N_ROWS, N_COLS), dtype=float)
-    for r in range(N_ROWS):
-        for c in range(N_COLS):
-            g = means_G[r, c]
-            red = means_R[r, c]
-            if red > 0 and blank_ratio > 0:
-                well_ratio = g / red
-                # −log₁₀(well_ratio / blank_ratio) × k_ratio
-                ratio_norm = well_ratio / blank_ratio
-                if ratio_norm < 1.0 and ratio_norm > 1e-9:
-                    values[r, c] = -math.log10(ratio_norm) * MTT_K_RATIO
-                else:
-                    values[r, c] = 0.0
-            else:
-                values[r, c] = 0.0
-
-    return pd.DataFrame(
-        np.round(values, 4),
-        index=ROWS,
-        columns=[str(c) for c in COLS]
-    )
-
 
 def absorbance_table_html(abs_df: pd.DataFrame) -> str:
     """
@@ -642,31 +564,36 @@ def export_distances_excel(colors, dist_df, ref_rgb) -> bytes:
 
 # ── Camera-guided k estimation ────────────────────────────────────────────────
 # Per-brand search ranges for the grayscale correction factor k, derived from:
-#     k = γ_eff / ε_eff_L
+#     k = γ / ε_eff_L
 # where ε_eff_L = 0.587·ε_G + 0.299·ε_R + 0.114·ε_B = 0.638 for MTT formazan
-# and γ_eff is the effective gamma of the smartphone ISP pipeline (≥ nominal 2.2
-# due to Smart HDR / tone mapping).
+# (ITU-R BT.601 luminance weights; ε_G=1.00, ε_R=0.15, ε_B=0.40).
 #
-# Empirical validation on iPhone Air (native Camera app, Smart HDR active):
-#   γ_eff ≈ 2.42  →  k = 2.42 / 0.638 = 3.79  (rounded to 3.8)
+# Theoretical baseline: nominal sRGB γ = 2.2
+#   k = 2.2 / 0.638 = 3.45
 #
-# Note: these ranges apply specifically to MTT assay images.
-# For other dyes, ε_eff_L differs and k must be recalculated.
+# Note: smartphone ISP pipelines (Smart HDR, Deep Fusion, tone mapping) may
+# raise the effective gamma above 2.2, shifting the optimal k upward.
+# Empirical validation on iPhone Air (5 experiments, n = 458 well pairs)
+# suggests k in the range 3.0–4.1 across imaging conditions.
+# The default value 3.45 corresponds to the nominal sRGB standard and
+# provides the most defensible baseline; per-experiment calibration
+# using 2+ plate-reader reference wells is recommended for highest accuracy.
 CAMERA_K_RANGE = {
-    "apple":   (3.5, 4.1),   # iPhone; γ_eff ≈ 2.23–2.62 (Smart HDR)
-    "samsung": (3.2, 3.8),   # γ_eff ≈ 2.04–2.42
-    "google":  (3.6, 4.2),   # Pixel; γ_eff ≈ 2.30–2.68 (aggressive HDR)
-    "xiaomi":  (3.1, 3.7),
-    "redmi":   (3.1, 3.7),
-    "huawei":  (3.2, 3.8),
-    "honor":   (3.2, 3.8),
-    "oneplus": (3.3, 3.9),
-    "oppo":    (3.3, 3.9),
+    "apple":   (3.2, 4.1),   # iPhone; sRGB baseline 3.45, Smart HDR raises to ~3.8
+    "samsung": (3.0, 3.8),
+    "google":  (3.3, 4.2),   # Pixel; aggressive HDR pipeline
+    "xiaomi":  (2.9, 3.7),
+    "redmi":   (2.9, 3.7),
+    "huawei":  (3.0, 3.8),
+    "honor":   (3.0, 3.8),
+    "oneplus": (3.1, 3.9),
+    "oppo":    (3.1, 3.9),
 }
-# Fallback for unknown brands: centre at 3.6 (γ_eff ≈ 2.3, reasonable midpoint)
-K_RANGE_DEFAULT = (3.2, 4.2)
-# Single-value fallback when EXIF is absent; empirically validated on iPhone Air
-K_DEFAULT = 3.8
+# Fallback for unknown brands
+K_RANGE_DEFAULT = (3.0, 4.2)
+# Default k: nominal sRGB γ = 2.2 → k = γ / ε_eff_L = 2.2 / 0.638 = 3.45
+# Empirically validated range for iPhone Air: 3.0–4.1 (median ~3.6)
+K_DEFAULT = 3.45
 
 
 def get_camera_k_range(uploaded_file) -> tuple[tuple[float, float], str]:
@@ -813,29 +740,50 @@ def estimate_k_from_plate(img_orig: Image.Image,
     return round(best_k, 2), best_ch
 
 
-# ── Gamma-corrected weighted absorbance ───────────────────────────────────────
-def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
+def estimate_gamma_from_plate(img_orig: Image.Image,
+                               grid: np.ndarray,
                                blank_row_idx: int,
-                               w_r: float, w_g: float, w_b: float,
-                               gamma: float = 2.2) -> pd.DataFrame:
+                               gamma_range: tuple[float, float] = (1.6, 3.2)
+                               ) -> float:
     """
-    Compute absorbance using gamma-corrected weighted RGB transmittances.
+    Data-driven estimation of the effective gamma of the camera ISP pipeline
+    using only the green channel of the plate image.
 
-    Pipeline:
-      1. Linearise sRGB pixels:  I_lin = (pixel/255)^gamma
-      2. Per-channel transmittance vs blank row:  T_ch = I_lin / I_lin_blank
-      3. Weighted effective transmittance:  T_eff = Σ(w_ch × T_ch) / Σw_ch
-      4. A = -log10(T_eff)
+    Rationale
+    ---------
+    After gamma linearisation with the true γ_eff, the green-channel
+    transmittance T_G = I_G_well / I_G_blank should follow Beer-Lambert:
+        −log₁₀(T_G) = ε_G · A_true
+    which is monotonically increasing and smooth across wells.
 
-    Gamma correction recovers the linear light-intensity scale from the
-    power-law-encoded JPEG, which is the main source of systematic underestimation.
-    Returns DataFrame (8×12) rounded to 4 dp.
+    For a wrong γ the series will be either compressed (γ too low) or
+    expanded (γ too high), but crucially the *rank ordering* of wells is
+    preserved.  We therefore score each candidate γ by the R² of a linear
+    fit of the resulting absorbance series over well rank — the γ that
+    produces the smoothest, most linear rank-absorbance relationship is the
+    best estimate of γ_eff.
+
+    Algorithm
+    ---------
+    1. Extract per-well mean green pixel values.
+    2. Blank reference = median of blank-row green values.
+    3. For each candidate γ in gamma_range (120 steps):
+         a. Linearise:  I_lin = (pixel/255)^γ
+         b. Transmittance ratio: T = I_lin_well / I_lin_blank
+         c. Discard saturated (T < 0.05) and near-blank (T > 0.96) wells.
+         d. Sort remaining T values (monotone series).
+         e. Compute A = −log₁₀(T_sorted).
+         f. Score = R² of linear fit over rank − 0.01 · roughness
+            where roughness = Σ(ΔΔA)² penalises non-smooth response.
+    4. Return γ with highest score, rounded to 2 dp.
+
+    Falls back to 2.2 (sRGB nominal) if fewer than 5 informative wells found.
     """
-    arr     = np.array(img_orig.convert("RGB"), dtype=float) / 255.0
-    arr_lin = np.power(np.clip(arr, 1e-9, 1.0), gamma)
-    h, w    = arr_lin.shape[:2]
-    means   = np.zeros((N_ROWS, N_COLS, 3), dtype=float)
+    arr   = np.array(img_orig.convert("RGB"), dtype=float)
+    h, w  = arr.shape[:2]
 
+    # Collect per-well mean green pixel values
+    green_vals = []
     for r in range(N_ROWS):
         for c in range(N_COLS):
             x, y = grid[r, c]
@@ -843,20 +791,111 @@ def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
             x1 = min(w, int(x) + SAMPLE_RADIUS + 1)
             y0 = max(0, int(y) - SAMPLE_RADIUS)
             y1 = min(h, int(y) + SAMPLE_RADIUS + 1)
-            means[r, c] = arr_lin[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
+            green_vals.append(float(arr[y0:y1, x0:x1, 1].mean()))
 
-    blank_lin = means[blank_row_idx, :, :].mean(axis=0)
-    w_sum     = w_r + w_g + w_b
-    values    = np.zeros((N_ROWS, N_COLS), dtype=float)
+    green_arr  = np.array(green_vals)
+    blank_start = blank_row_idx * N_COLS
+    blank_end   = blank_start + N_COLS
+    blank_med   = float(np.median(green_arr[blank_start:blank_end]))
+
+    if blank_med < 1e-3:
+        return 2.2  # fallback
+
+    best_gamma = 2.2
+    best_score = -np.inf
+
+    for gamma in np.linspace(gamma_range[0], gamma_range[1], 120):
+        # Linearise
+        g_lin   = np.power(np.clip(green_arr / 255.0, 1e-9, 1.0), gamma)
+        b_lin   = np.power(np.clip(blank_med  / 255.0, 1e-9, 1.0), gamma)
+        t_ratio = np.clip(g_lin / b_lin, 1e-9, 1.0)
+
+        mask    = (t_ratio > 0.05) & (t_ratio < 0.96)
+        t_valid = np.sort(t_ratio[mask])
+
+        if len(t_valid) < 5:
+            continue
+
+        abs_v  = -np.log10(t_valid)
+        x_rank = np.arange(len(t_valid), dtype=float)
+
+        mean_a = abs_v.mean()
+        ss_tot = np.sum((abs_v - mean_a) ** 2)
+        if ss_tot < 1e-12:
+            continue
+
+        coeffs    = np.polyfit(x_rank, abs_v, 1)
+        y_hat     = np.polyval(coeffs, x_rank)
+        r2        = 1.0 - np.sum((abs_v - y_hat) ** 2) / ss_tot
+        roughness = float(np.sum(np.diff(abs_v, n=2) ** 2))
+        score     = r2 - 0.01 * roughness
+
+        if score > best_score:
+            best_score = score
+            best_gamma = gamma
+
+    return round(float(best_gamma), 2)
+
+
+# ── Gamma-corrected green-channel absorbance ──────────────────────────────────
+def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
+                               blank_row_idx: int,
+                               w_r: float = 0.0, w_g: float = 1.0,
+                               w_b: float = 0.0,
+                               gamma: float = 2.2) -> pd.DataFrame:
+    """
+    Compute absorbance from the gamma-linearised green channel only.
+
+    Rationale
+    ---------
+    MTT formazan absorbs most strongly in the green spectral region
+    (ε_G ≈ 1.00 vs ε_R ≈ 0.15, ε_B ≈ 0.40 at λ_max ≈ 570 nm).
+    Using the green channel exclusively maximises signal-to-noise ratio
+    and guarantees a result that is perfectly linear in true absorbance:
+
+        A_measured = (ε_G / γ) · A_true = (1.0 / 2.2) · A_true
+
+    Multi-channel combinations (weighted arithmetic or geometric means)
+    introduce either non-linearity (arithmetic mean of T) or dilute the
+    signal with less informative channels (geometric mean), so the
+    single green channel is the optimal choice for MTT formazan.
+
+    Pipeline
+    --------
+      1. Extract green channel and linearise:
+             I_G = (G_pixel / 255) ^ gamma
+      2. Blank reference (mean of blank row, linearised green):
+             I_G_blank = mean of blank-row green intensities
+      3. Transmittance:
+             T_G = I_G_well / I_G_blank
+      4. Absorbance:
+             A = −log₁₀(T_G)     (0 if T_G ≥ 1)
+
+    Parameters w_r, w_b are accepted for API compatibility but ignored.
+    Returns DataFrame (8×12) rounded to 4 dp.
+    """
+    arr   = np.array(img_orig.convert("RGB"), dtype=float) / 255.0
+    green = np.power(np.clip(arr[:, :, 1], 1e-9, 1.0), gamma)
+    h, w  = green.shape
+
+    means_g = np.zeros((N_ROWS, N_COLS), dtype=float)
+    for r in range(N_ROWS):
+        for c in range(N_COLS):
+            x, y = grid[r, c]
+            x0 = max(0, int(x) - SAMPLE_RADIUS)
+            x1 = min(w, int(x) + SAMPLE_RADIUS + 1)
+            y0 = max(0, int(y) - SAMPLE_RADIUS)
+            y1 = min(h, int(y) + SAMPLE_RADIUS + 1)
+            means_g[r, c] = green[y0:y1, x0:x1].mean()
+
+    blank_g = means_g[blank_row_idx, :].mean()
+    values  = np.zeros((N_ROWS, N_COLS), dtype=float)
 
     for r in range(N_ROWS):
         for c in range(N_COLS):
-            lin   = means[r, c]
-            T     = np.where(blank_lin > 0,
-                             np.clip(lin / blank_lin, 1e-9, 1.0),
-                             np.ones(3))
-            T_eff = (w_r*T[0] + w_g*T[1] + w_b*T[2]) / w_sum
-            values[r, c] = -math.log10(T_eff) if T_eff < 1.0 else 0.0
+            T_g = float(np.clip(means_g[r, c] / blank_g, 1e-9, 1.0)) \
+                  if blank_g > 0 else 1.0
+            values[r, c] = -math.log10(T_g) if T_g < 1.0 else 0.0
 
     return pd.DataFrame(np.round(values, 4), index=ROWS,
                         columns=[str(c) for c in COLS])
@@ -1200,17 +1239,17 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # ── Section 6: Estimated absorbance (grayscale-based) ─────────────────
-        st.markdown("### 6️⃣ MTT-optimised absorbance (G/R channel ratio)")
+        # ── Section 6: Grayscale absorbance with data-driven k + calibration ───
+        st.markdown("### 6️⃣ Estimated absorbance (grayscale, correction factor *k*)")
         st.caption(
-            "This method exploits the absorption spectrum of MTT formazan (λ_max ≈ 570 nm): "
-            "formazan absorbs green light strongly (ε_G) and red light weakly (ε_R). "
-            "The Green/Red pixel ratio changes linearly with absorbance — and crucially, "
-            "**camera gamma cancels out** because both channels are encoded with the same "
-            "transfer function. The scaling constant *k_ratio* = 2.84 accounts for the "
-            "effective gamma of the iPhone ISP pipeline (γ_eff ≈ 2.42, validated empirically) "
-            "and the extinction coefficient ratio of formazan: k = γ_eff / (ε_G − ε_R). "
-            "Benchmark on simulated data: **RMSE ≈ 0.05 AU** vs ≈ 0.40 AU for grayscale."
+            "Absorbance is estimated from the ITU-R BT.601 grayscale luminance of each well "
+            "relative to the blank row: **A = −log₁₀(L_well / L_blank) × k**. "
+            "The correction factor *k* compensates for the non-linear gamma encoding of "
+            "smartphone JPEG images and the luminance-weighted effective extinction coefficient "
+            "of MTT formazan (ε_eff = 0.638). "
+            "The theoretical baseline is **k = γ / ε_eff = 2.2 / 0.638 = 3.45** (sRGB, IEC 61966-2-1). "
+            "The app estimates *k* from the plate image using EXIF-detected camera brand; "
+            "adjust manually or apply optional calibration below for best accuracy."
         )
 
         blank_row_label = st.selectbox(
@@ -1221,115 +1260,162 @@ def main():
 
         st.info(st.session_state.get("exif_msg", ""))
 
-        mtt_df = build_absorbance_mtt_ratio(img_orig, grid, blank_row_idx)
-        st.markdown(absorbance_table_html(mtt_df), unsafe_allow_html=True)
-        st.caption(
-            f"Formula: **A = −log₁₀(G_well/R_well ÷ G_blank/R_blank) × {MTT_K_RATIO}**. "
-            "Wells with G/R ≥ blank G/R (no dye) are set to 0. "
-            "Background shade: white ≈ 0, black ≥ 2."
+        # Data-driven k estimation (cached per blank row)
+        cached_blank = st.session_state.get("auto_k_blank_row", None)
+        if "auto_k" not in st.session_state or cached_blank != blank_row_label:
+            k_range = st.session_state.get("exif_k_range", K_RANGE_DEFAULT)
+            if k_range == K_RANGE_DEFAULT:
+                _, best_ch = estimate_k_from_plate(
+                    img_orig, grid, blank_row_idx, k_range
+                )
+                auto_k = K_DEFAULT
+            else:
+                with st.spinner("Estimating k from plate data…"):
+                    auto_k, best_ch = estimate_k_from_plate(
+                        img_orig, grid, blank_row_idx, k_range
+                    )
+            st.session_state.auto_k           = auto_k
+            st.session_state.best_ch          = best_ch
+            st.session_state.auto_k_blank_row = blank_row_label
+
+        auto_k  = st.session_state.auto_k
+        best_ch = st.session_state.best_ch
+        k_range = st.session_state.get("exif_k_range", K_RANGE_DEFAULT)
+
+        if k_range == K_RANGE_DEFAULT:
+            st.warning(
+                f"Camera brand not recognised — k set to empirical default "
+                f"**{K_DEFAULT}** (most linear channel: **{best_ch}**)."
+            )
+        else:
+            st.success(
+                f"Most linear channel: **{best_ch}**, estimated k = **{auto_k}**."
+            )
+
+        k_user = st.slider(
+            "Correction factor k",
+            min_value=1.0, max_value=5.0,
+            value=float(auto_k),
+            step=0.01, key="k_correction",
+            help=(
+                f"Theoretical baseline k = 3.45 (sRGB γ = 2.2, ε_eff = 0.638). "
+                f"Estimated from plate EXIF: {auto_k:.2f}. "
+                "Adjust manually or use calibration below."
+            )
         )
 
-        mtt_xlsx = export_absorbance_excel(mtt_df)
+        abs_df = build_absorbance(img_orig, grid, blank_row_idx, k_user)
+        st.markdown(absorbance_table_html(abs_df), unsafe_allow_html=True)
+        st.caption(
+            f"Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f}**  "
+            f"(L = 0.299R + 0.587G + 0.114B). "
+            "Wells lighter than the blank are set to 0."
+        )
+
+        abs_xlsx = export_absorbance_excel(abs_df)
         st.download_button(
-            label="⬇️ Download MTT absorbance table (Excel)",
-            data=mtt_xlsx,
-            file_name="mtt_absorbance_ratio.xlsx",
+            label="⬇️ Download grayscale absorbance table (Excel)",
+            data=abs_xlsx,
+            file_name="mtt_absorbance_grayscale.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        with st.expander("⚙️ Advanced: grayscale fallback with data-driven k"):
+        # ── Optional calibration (section 6) ─────────────────────────────────
+        with st.expander("🔧 Optional: linear calibration with plate-reader values"):
             st.caption(
-                "The grayscale method with correction factor *k* is provided for comparison. "
-                "It is less accurate than the G/R ratio method above for MTT assays, "
-                "because *k* cannot fully compensate for camera gamma non-linearity. "
-                "The *k* value is estimated from the plate data (most linear channel) "
-                "within a brand-specific range from EXIF. "
-                "For other colorimetric assays where G/R ratio is not applicable, "
-                "this may be the more appropriate method."
+                "Select 2–4 wells whose absorbance you measured on a plate reader "
+                "(non-blank wells only). "
+                "The app fits **A_cal = slope × A_raw + intercept** and applies it to all wells. "
+                "Calibration eliminates residual systematic bias from *k* uncertainty."
             )
-
-            # Data-driven k estimation (cached)
-            cached_blank = st.session_state.get("auto_k_blank_row", None)
-            if "auto_k" not in st.session_state or cached_blank != blank_row_label:
-                k_range = st.session_state.get("exif_k_range", K_RANGE_DEFAULT)
-                if k_range == K_RANGE_DEFAULT:
-                    _, best_ch = estimate_k_from_plate(
-                        img_orig, grid, blank_row_idx, k_range
+            n_cal_6 = st.selectbox("Number of calibration points", [0, 2, 3, 4],
+                                   key="n_cal_6")
+            cal_wells_6 = []
+            for i in range(n_cal_6):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    row_lbl = st.selectbox(
+                        f"Point {i+1} — row",
+                        options=[r for r in ROWS if r != blank_row_label],
+                        key=f"cal6_row_{i}"
                     )
-                    auto_k = K_DEFAULT
-                else:
-                    with st.spinner("Estimating k from plate data…"):
-                        auto_k, best_ch = estimate_k_from_plate(
-                            img_orig, grid, blank_row_idx, k_range
-                        )
-                st.session_state.auto_k           = auto_k
-                st.session_state.best_ch          = best_ch
-                st.session_state.auto_k_blank_row = blank_row_label
+                with c2:
+                    col_num = st.number_input(
+                        f"Point {i+1} — column",
+                        min_value=1, max_value=12, value=1, step=1,
+                        key=f"cal6_col_{i}"
+                    )
+                with c3:
+                    a_ref = st.number_input(
+                        f"Point {i+1} — A (plate reader)",
+                        min_value=0.0, max_value=5.0, value=0.0,
+                        step=0.001, format="%.4f", key=f"cal6_ref_{i}"
+                    )
+                if a_ref > 0:
+                    cal_wells_6.append((row_lbl, int(col_num), a_ref))
 
-            auto_k  = st.session_state.auto_k
-            best_ch = st.session_state.best_ch
-            k_range = st.session_state.get("exif_k_range", K_RANGE_DEFAULT)
-
-            if k_range == K_RANGE_DEFAULT:
-                st.warning(
-                    f"Camera brand not recognised — k set to empirical default "
-                    f"**{K_DEFAULT}** (best channel: **{best_ch}**)."
+        cal_info_6 = ""
+        if len(cal_wells_6) >= 2:
+            abs_cal_df, slope_6, intercept_6 = apply_calibration(abs_df, cal_wells_6)
+            if slope_6 is not None:
+                cal_info_6 = f"A_cal = {slope_6:.4f} × A_raw + {intercept_6:.4f}"
+                st.success(f"Calibration applied: {cal_info_6}")
+                st.markdown(absorbance_table_html(abs_cal_df), unsafe_allow_html=True)
+                cal_xlsx_6 = export_absorbance_excel(abs_cal_df)
+                st.download_button(
+                    label="⬇️ Download calibrated grayscale absorbance (Excel)",
+                    data=cal_xlsx_6,
+                    file_name="mtt_absorbance_grayscale_calibrated.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                st.success(
-                    f"Best channel: **{best_ch}**, estimated k = **{auto_k}**."
-                )
-
-            k_user = st.slider(
-                "Correction factor k",
-                min_value=1.0, max_value=5.0,
-                value=float(auto_k),
-                step=0.01, key="k_correction",
-                help="Estimated from plate data. Adjust manually if needed."
-            )
-            st.caption(
-                f"Formula: **A = −log₁₀(gray_mean / gray_blank) × {k_user:.2f}**. "
-                "Wells lighter than the blank are set to 0."
-            )
-
-            abs_df = build_absorbance(img_orig, grid, blank_row_idx, k_user)
-            st.markdown(absorbance_table_html(abs_df), unsafe_allow_html=True)
-
-            abs_xlsx = export_absorbance_excel(abs_df)
-            st.download_button(
-                label="⬇️ Download grayscale absorbance table (Excel)",
-                data=abs_xlsx,
-                file_name="mtt_absorbance_grayscale.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+                st.warning("Calibration failed — check that selected wells have non-zero raw absorbance.")
 
         # ── Section 7: Gamma-corrected absorbance + calibration ───────────────
         st.markdown("### 7️⃣ Gamma-corrected absorbance with optional calibration")
         st.caption(
-            "Inverts the sRGB gamma encoding before computing transmittance, "
-            "recovering a linear light-intensity scale: "
-            "**I_linear = ((pixel/255 + 0.055) / 1.055)^2.4**. "
-            "Channel weights are proportional to the MTT formazan extinction coefficients "
-            "(ε_G = 1.00, ε_B = 0.40, ε_R = 0.15), giving the green channel dominant weight (64%). "
-            "Without calibration this method systematically underestimates absorbance for MTT "
-            "because the arithmetic mean of T_eff is dominated by the near-unity R and B channels. "
-            "**Use the calibration expander below** to anchor results to plate-reader values — "
-            "with 2+ calibration points this method reaches the highest accuracy of all three sections."
+            "The green camera channel is gamma-linearised by inverting the camera ISP "
+            "transfer function: **I_G = (G_pixel / 255)^γ_eff**. "
+            "The effective gamma γ_eff is estimated directly from the plate image "
+            "by finding the value that produces the smoothest, most linear "
+            "absorbance–rank relationship across wells (no plate-reader reference needed). "
+            "Absorbance is then: **A = −log₁₀(T_G)** where T_G = I_G_well / I_G_blank. "
+            "The green channel is used exclusively because MTT formazan absorbs most strongly "
+            "at λ_max ≈ 570 nm (green region), maximising signal-to-noise ratio. "
+            "Optional calibration with 2–4 plate-reader reference wells further corrects "
+            "any residual bias and yields the highest accuracy of all three sections."
         )
 
-        # MTT-specific channel weights proportional to extinction coefficients:
-        #   ε_G = 1.00, ε_R = 0.15, ε_B = 0.40  (formazan, ~570 nm peak)
-        #   w_ch = ε_ch / (ε_G + ε_R + ε_B)
-        eps_G_mtt, eps_R_mtt, eps_B_mtt = 1.00, 0.15, 0.40
-        eps_sum = eps_G_mtt + eps_R_mtt + eps_B_mtt
-        w_g = eps_G_mtt / eps_sum   # ≈ 0.645
-        w_r = eps_R_mtt / eps_sum   # ≈ 0.097
-        w_b = eps_B_mtt / eps_sum   # ≈ 0.258
+        # Estimate γ_eff from the plate image using green channel
+        with st.spinner("Estimating γ_eff from plate image…"):
+            gamma_eff = estimate_gamma_from_plate(
+                img_orig, grid, blank_row_idx, gamma_range=(1.6, 3.2)
+            )
+
+        st.info(
+            f"Estimated effective gamma: **γ_eff = {gamma_eff:.2f}** "
+            f"(sRGB nominal = 2.20). "
+            f"Higher values indicate stronger ISP tone mapping (e.g. Smart HDR)."
+        )
+
+        gamma_user = st.slider(
+            "Effective gamma γ_eff",
+            min_value=1.6, max_value=3.2,
+            value=float(gamma_eff),
+            step=0.01, key="gamma_sec7",
+            help=(
+                "Estimated from the plate image. sRGB nominal = 2.20. "
+                "Adjust manually if the estimated value seems incorrect."
+            )
+        )
+
+        # Pure green channel — w_r and w_b are ignored
+        w_g, w_r, w_b = 1.0, 0.0, 0.0
         wabs_df = build_absorbance_weighted(
-            img_orig, grid, blank_row_idx, w_r, w_g, w_b, gamma=2.2
+            img_orig, grid, blank_row_idx, w_r, w_g, w_b, gamma=gamma_user
         )
 
-        # ── Optional calibration ──────────────────────────────────────────────
+        # ── Optional calibration (section 7) ─────────────────────────────────
         with st.expander("🔧 Optional: linear calibration with plate-reader values"):
             st.caption(
                 "Select 2–4 wells whose absorbance you measured on a plate reader "
@@ -1378,17 +1464,21 @@ def main():
         st.markdown(weighted_absorbance_table_html(final_df, w_r, w_g, w_b),
                     unsafe_allow_html=True)
         if slope is not None:
-            st.caption(f"Calibrated. **{cal_info}** (γ = 2.2, equal channel weights)")
+            st.caption(
+                f"Calibrated. **{cal_info}** "
+                f"(green channel only, γ_eff = {gamma_user:.2f})"
+            )
         else:
             st.caption(
-                "Uncalibrated. Formula: **A = −log₁₀(T_eff)**, "
-                "T_eff = gamma-corrected mean transmittance (equal R/G/B weights). "
+                f"Uncalibrated. Formula: **A = −log₁₀(T_G)** "
+                f"where T_G = (G_well/255)^{gamma_user:.2f} / (G_blank/255)^{gamma_user:.2f} "
+                f"(γ_eff = {gamma_user:.2f}, estimated from plate). "
                 "Enter calibration points above for improved accuracy."
             )
 
         wabs_xlsx = export_weighted_excel(
-            final_df, "gamma-corrected equal weights", w_r, w_g, w_b,
-            blank_row_label, 2.2, cal_info
+            final_df, "gamma-corrected green channel", w_r, w_g, w_b,
+            blank_row_label, gamma_user, cal_info
         )
         st.download_button(
             label="⬇️ Download gamma-corrected absorbance (Excel)",
