@@ -75,20 +75,8 @@ def euclidean(c1, c2):
 
 
 def build_results(img_array, grid, ref_row_idx: int = 0):
-    """
-    Sample colors at all 96 well positions and compute Euclidean RGB distances
-    relative to a single reference vector derived from a user-selected reference row.
-
-    The reference is the luminance-weighted mean RGB vector of all 12 wells in the
-    selected reference row:
-        L = 0.299·R + 0.587·G + 0.114·B
-    Wells with higher luminance contribute more to the reference.
-
-    Returns:
-        colors   : ndarray of shape (8, 12, 3) with mean RGB per well
-        dist_df  : DataFrame (8×12) of Euclidean distances from the reference
-        ref_rgb  : 1-D array (3,) — the reference RGB vector used
-    """
+    """Sample 11×11 px regions at all 96 well positions. Returns (colors 8×12×3,
+    dist_df 8×12, ref_rgb) with Euclidean distances from the reference row."""
     colors = np.zeros((N_ROWS, N_COLS, 3), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
@@ -154,17 +142,7 @@ def draw_grid_on_image(img: Image.Image, grid: np.ndarray,
 
 
 def zoom_crop(img: Image.Image, cx: int, cy: int, zoom: int) -> tuple:
-    """
-    Return a zoomed view of the image centred on (cx, cy).
-
-    At zoom=100 the original image is returned unchanged (no crop).
-    At zoom>100 a region of size (width * 100/zoom) is cropped around (cx, cy)
-    and upscaled back to the original dimensions, simulating optical zoom.
-
-    Returns:
-        (zoomed_image, offset_x, offset_y)
-        offset_x/y: top-left corner of the crop in original image coordinates
-    """
+    """Crop a zoomed view centred on (cx, cy); zoom=100 = no crop."""
     if zoom <= 100:
         return img, 0, 0
     # Visible region size = original size * (100 / zoom)
@@ -329,24 +307,8 @@ def export_inverted_excel(gray_df: pd.DataFrame) -> bytes:
 def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
                      blank_row_idx: int = 0,
                      k_override: float = 3.0) -> pd.DataFrame:
-    """
-    Compute approximate absorbance for each well using a global blank reference.
-
-    The blank is estimated as the mean grayscale intensity of all 12 wells in the
-    selected blank row. This represents unabsorbed light, analogous to the blank
-    cuvette in a spectrophotometer.
-
-        gray_blank = mean of all blank-row well intensities
-        gray_mean  = mean of all pixels in the 11×11 px region of each well
-        A          = -log10(gray_mean / gray_blank) × k_override
-
-    k_override is a user-supplied correction factor that compensates for smartphone
-    camera gamma and JPEG compression. It can be calibrated as:
-        k = A_expected (from plate reader) / A_raw (from this function with k=1)
-
-    Returns a DataFrame (8×12) of absorbance values rounded to 4 decimal places.
-    Wells lighter than the blank are set to 0.
-    """
+    """A = −log10(L_well / L_blank) × k. Blank = mean of blank-row luminance.
+    Returns 8×12 DataFrame; wells lighter than blank → 0."""
     img_gray   = img_orig.convert("L")
     gray_array = np.array(img_gray, dtype=float)
     h, w       = gray_array.shape
@@ -495,12 +457,7 @@ def export_absorbance_excel(abs_df: pd.DataFrame) -> bytes:
 
 
 def export_distances_excel(colors, dist_df, ref_rgb) -> bytes:
-    """
-    Create a formatted Excel workbook with the Euclidean distance table.
-    Structure mirrors the grayscale export: column headers in row 1, data from row 2.
-    Each cell background reflects the actual well colour.
-    Row A cells have a red border; the minimum per column (B–H) is bold and underlined.
-    """
+    """Export Euclidean-distance table with actual well colours to Excel. Returns .xlsx bytes."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Euclidean distances"
@@ -616,45 +573,28 @@ CAMERA_GAMMA_EFF = {
 GAMMA_EFF_DEFAULT = 2.2   # sRGB nominal fallback
 
 
-def get_camera_k_range(uploaded_file) -> tuple[tuple[float, float], str]:
-    """
-    Read EXIF Make/Model from the uploaded image and return a brand-specific
-    (k_min, k_max) search range together with a human-readable status string.
-    Falls back to K_RANGE_DEFAULT when EXIF is absent or brand is unrecognised.
-    """
+def read_exif_camera(buf: io.BytesIO) -> tuple[str, str]:
+    """Return (make_lower, model) from EXIF, or ('', '') on failure."""
     try:
-        uploaded_file.seek(0)
-        raw_bytes = uploaded_file.read()
-        uploaded_file.seek(0)
-        buf = io.BytesIO(raw_bytes)
+        img = Image.open(buf); img.load()
+        ex  = img.getexif()
+        return str(ex.get(271, "")).strip().lower(), str(ex.get(272, "")).strip()
+    except Exception:
+        return "", ""
 
-        img_raw = Image.open(buf)
-        img_raw.load()
 
-        try:
-            exif_data = img_raw.getexif()
-            make  = str(exif_data.get(271, "")).strip().lower()
-            model = str(exif_data.get(272, "")).strip()
-        except AttributeError:
-            raw_exif = img_raw._getexif() or {}
-            make  = str(raw_exif.get(271, "")).strip().lower()
-            model = str(raw_exif.get(272, "")).strip()
-
-        if not make:
-            return K_RANGE_DEFAULT, "No EXIF camera data found — using wide k search range."
-
-        for brand, k_range in CAMERA_K_RANGE.items():
-            if brand in make:
-                return (k_range,
-                        f"Detected: **{make.title()} {model}** "
-                        f"→ k search range {k_range[0]}–{k_range[1]}")
-
-        return (K_RANGE_DEFAULT,
-                f"Detected: **{make.title()} {model}** "
-                f"(unknown brand) → wide k search range {K_RANGE_DEFAULT[0]}–{K_RANGE_DEFAULT[1]}")
-
-    except Exception as e:
-        return K_RANGE_DEFAULT, f"Could not read EXIF data ({e}) — using wide k search range."
+def get_camera_k_range(uploaded_file) -> tuple[tuple[float, float], str]:
+    """Brand-specific k search range from EXIF Make."""
+    make, model = read_exif_camera(uploaded_file)
+    if not make:
+        return K_RANGE_DEFAULT, "No EXIF camera data — using wide k search range."
+    for brand, k_range in CAMERA_K_RANGE.items():
+        if brand in make:
+            return k_range, (f"Detected: **{make.title()} {model}** "
+                             f"→ k search range {k_range[0]}–{k_range[1]}")
+    return (K_RANGE_DEFAULT,
+            f"Detected: **{make.title()} {model}** "
+            f"(unknown brand) → wide k range {K_RANGE_DEFAULT[0]}–{K_RANGE_DEFAULT[1]}")
 
 
 def estimate_k_from_plate(img_orig: Image.Image,
@@ -663,37 +603,9 @@ def estimate_k_from_plate(img_orig: Image.Image,
                            k_range: tuple[float, float]
                            ) -> tuple[float, str]:
     """
-    Data-driven estimation of the optimal correction factor k and the most
-    informative RGB channel, using only the plate image itself (no plate-reader
-    reference required).
-
-    Algorithm
-    ---------
-    For each RGB channel independently:
-      1. Compute per-well mean pixel intensity; normalise by blank-row median
-         to obtain transmittance ratios T ∈ (0, 1].
-      2. Discard saturated wells (T < 0.05) and near-blank wells (T > 0.96)
-         that carry no useful absorbance information.
-      3. Sort the remaining transmittance values to obtain a monotone series.
-      4. For each candidate k in k_range (100 steps), compute
-            A = −k · log₁₀(T_sorted)
-         and score the result with:
-            score = R² of linear fit over rank − 0.02 · roughness
-         where roughness = Σ(ΔΔA)² penalises non-smooth (noisy) channels.
-      5. Keep the (channel, k) pair with the highest score overall.
-
-    Returns
-    -------
-    best_k    : float — estimated optimal k, rounded to 2 decimal places
-    best_ch   : str   — name of the most linear channel ("R", "G", or "B")
-
-    Notes
-    -----
-    The score does NOT require a spectrophotometer reference; it is a heuristic
-    that rewards channels and k values for which the absorbance series is
-    smooth and monotone. For MTT formazan (λ_max ≈ 570 nm, purple colour),
-    the green channel almost always wins because purple absorbs green light
-    most strongly, producing the largest dynamic range.
+    Data-driven k estimation from the plate image alone (no plate-reader needed).
+    Scores (channel, k) pairs by R² of absorbance-vs-rank linearity minus a
+    roughness penalty. Returns (best_k, best_channel).
     """
     arr = np.array(img_orig.convert("RGB"), dtype=float)
     h, w = arr.shape[:2]
@@ -760,54 +672,17 @@ def estimate_k_from_plate(img_orig: Image.Image,
     return round(best_k, 2), best_ch
 
 
-def get_camera_gamma_eff(uploaded_file) -> tuple[float, str]:
-    """
-    Return the per-brand effective gamma γ_eff for section 7 linearisation.
-
-    γ_eff cannot be estimated from a single MTT plate image without
-    spectrophotometric reference values: any scoring metric based on
-    smoothness or linearity of the absorbance-rank curve is invariant to
-    gamma scaling (both signal and noise scale by the same factor), so the
-    optimiser collapses to the boundary of the search range.
-
-    Instead, per-brand γ_eff values are derived from the empirical
-    relationship k = γ_eff / ε_eff_L:
-        γ_eff = k_empirical × ε_eff_L   (ε_eff_L = 0.638 for MTT formazan)
-
-    For iPhone Air, γ_eff = 2.42 was validated across 5 experiments (n = 372).
-    Returns (gamma_eff, status_message).
-    """
-    try:
-        from PIL import Image as PILImage
-        import piexif
-        img_raw = PILImage.open(uploaded_file)
-        uploaded_file.seek(0)
-        try:
-            exif_data = {
-                PILImage.ExifTags.TAGS.get(k, k): v
-                for k, v in (img_raw._getexif() or {}).items()
-            }
-            make = str(exif_data.get("Make", "")).strip().lower()
-        except AttributeError:
-            raw_exif = img_raw._getexif() or {}
-            make = str(raw_exif.get(271, "")).strip().lower()
-
-        if not make:
-            return GAMMA_EFF_DEFAULT, \
-                f"No EXIF data — using sRGB nominal γ_eff = {GAMMA_EFF_DEFAULT:.2f}."
-
-        for brand, gamma in CAMERA_GAMMA_EFF.items():
-            if brand in make:
-                return gamma, \
-                    f"Detected: **{make.title()}** → γ_eff = **{gamma:.2f}** " \
-                    f"(empirically validated for this brand)."
-
-        return GAMMA_EFF_DEFAULT, \
-            f"Brand '{make.title()}' not in database — using sRGB nominal γ_eff = {GAMMA_EFF_DEFAULT:.2f}."
-
-    except Exception as e:
-        return GAMMA_EFF_DEFAULT, \
-            f"Could not read EXIF ({e}) — using sRGB nominal γ_eff = {GAMMA_EFF_DEFAULT:.2f}."
+def get_camera_gamma_eff(buf: io.BytesIO) -> tuple[float, str]:
+    """Brand-specific γ_eff from EXIF Make (empirically validated per brand)."""
+    make, _ = read_exif_camera(buf)
+    if not make:
+        return GAMMA_EFF_DEFAULT, f"No EXIF data — γ_eff = {GAMMA_EFF_DEFAULT:.2f} (sRGB nominal)."
+    for brand, gamma in CAMERA_GAMMA_EFF.items():
+        if brand in make:
+            return gamma, (f"Detected: **{make.title()}** → γ_eff = **{gamma:.2f}** "
+                           f"(empirically validated).")
+    return GAMMA_EFF_DEFAULT, (f"Brand '{make.title()}' unknown — "
+                               f"γ_eff = {GAMMA_EFF_DEFAULT:.2f} (sRGB nominal).")
 
 
 # ── Gamma-corrected green-channel absorbance ──────────────────────────────────
@@ -816,37 +691,8 @@ def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
                                w_r: float = 0.0, w_g: float = 1.0,
                                w_b: float = 0.0,
                                gamma: float = 2.2) -> pd.DataFrame:
-    """
-    Compute absorbance from the gamma-linearised green channel only.
-
-    Rationale
-    ---------
-    MTT formazan absorbs most strongly in the green spectral region
-    (ε_G ≈ 1.00 vs ε_R ≈ 0.15, ε_B ≈ 0.40 at λ_max ≈ 570 nm).
-    Using the green channel exclusively maximises signal-to-noise ratio
-    and guarantees a result that is perfectly linear in true absorbance:
-
-        A_measured = (ε_G / γ) · A_true = (1.0 / 2.2) · A_true
-
-    Multi-channel combinations (weighted arithmetic or geometric means)
-    introduce either non-linearity (arithmetic mean of T) or dilute the
-    signal with less informative channels (geometric mean), so the
-    single green channel is the optimal choice for MTT formazan.
-
-    Pipeline
-    --------
-      1. Extract green channel and linearise:
-             I_G = (G_pixel / 255) ^ gamma
-      2. Blank reference (mean of blank row, linearised green):
-             I_G_blank = mean of blank-row green intensities
-      3. Transmittance:
-             T_G = I_G_well / I_G_blank
-      4. Absorbance:
-             A = −log₁₀(T_G)     (0 if T_G ≥ 1)
-
-    Parameters w_r, w_b are accepted for API compatibility but ignored.
-    Returns DataFrame (8×12) rounded to 4 dp.
-    """
+    """Green channel only: I_G=(G/255)^γ, T_G=I_G_well/I_G_blank, A=−log10(T_G).
+    w_r, w_b accepted for API compat but ignored. Returns 8×12 DataFrame."""
     arr   = np.array(img_orig.convert("RGB"), dtype=float) / 255.0
     green = np.power(np.clip(arr[:, :, 1], 1e-9, 1.0), gamma)
     h, w  = green.shape
@@ -876,16 +722,8 @@ def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
 
 def apply_calibration(raw_df: pd.DataFrame,
                       cal_wells: list) -> tuple:
-    """
-    Linear calibration from well-specific reference values.
-
-    cal_wells: list of (row_label str, col int 1-based, A_reference float)
-               e.g. [('B', 1, 1.784), ('C', 1, 0.466)]
-               These must be non-blank wells with known plate-reader absorbance.
-
-    Fits A_cal = slope × A_raw + intercept (least squares).
-    Returns (calibrated_df, slope, intercept) or (raw_df, None, None) if < 2 points.
-    """
+    """Fit A_cal = slope × A_raw + intercept from ≥2 reference wells.
+    Returns (df_calibrated, slope, intercept) or (df_raw, None, None)."""
     xs, ys = [], []
     for row_lbl, col_1, a_ref in cal_wells:
         if row_lbl in ROWS and 1 <= col_1 <= N_COLS:
@@ -1059,6 +897,10 @@ def main():
         k_range, exif_msg = get_camera_k_range(io.BytesIO(file_bytes))
         st.session_state.exif_k_range = k_range
         st.session_state.exif_msg     = exif_msg
+        # Also derive γ_eff from the same EXIF make
+        gamma_eff, gamma_msg = get_camera_gamma_eff(io.BytesIO(file_bytes))
+        st.session_state.gamma_eff     = gamma_eff
+        st.session_state.gamma_eff_msg = gamma_msg
 
     img_orig  = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img_array = np.array(img_orig)
@@ -1391,12 +1233,7 @@ def main():
             "If calibration points are provided above, they are applied automatically."
         )
 
-        # Get γ_eff from EXIF-based brand lookup
-        if "gamma_eff" not in st.session_state:
-            gamma_eff, gamma_msg = get_camera_gamma_eff(uploaded_file)
-            st.session_state.gamma_eff     = gamma_eff
-            st.session_state.gamma_eff_msg = gamma_msg
-
+        # γ_eff already loaded from EXIF at image load time
         gamma_eff = st.session_state.gamma_eff
         st.info(st.session_state.gamma_eff_msg)
 
