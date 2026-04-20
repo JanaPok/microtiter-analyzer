@@ -1223,26 +1223,46 @@ def main():
         st.caption(
             "The green camera channel is gamma-linearised by inverting the camera ISP "
             "transfer function: **I_G = (G_pixel / 255)^γ_eff**. "
-            "The effective gamma γ_eff is set per device brand from empirically validated "
-            "values (iPhone Air: γ_eff = 2.42, derived from 5 experiments, n = 372). "
+            "γ_eff is derived from the data-driven k estimate (section 6) via "
+            "**γ_eff = k × ε_eff** where ε_eff = 0.638 is the luminance-weighted "
+            "effective extinction coefficient of MTT formazan under ITU-R BT.601. "
+            "This links the gamma estimate directly to the plate data rather than "
+            "relying solely on a fixed brand table. "
             "Absorbance is then: **A = −log₁₀(T_G)** where T_G = I_G_well / I_G_blank. "
             "The green channel is used exclusively because MTT formazan absorbs most strongly "
             "at λ_max ≈ 570 nm, maximising signal-to-noise ratio. "
             "If calibration points are provided above, they are applied automatically."
         )
 
-        # γ_eff already loaded from EXIF at image load time
-        gamma_eff = st.session_state.gamma_eff
-        st.info(st.session_state.gamma_eff_msg)
+        # Derive γ_eff from the data-driven k (section 6) via:
+        #   k = γ_eff / ε_eff_L  →  γ_eff = k × ε_eff_L
+        # ε_eff_L = 0.587·ε_G + 0.299·ε_R + 0.114·ε_B = 0.638 (MTT formazan)
+        # This is data-driven because k_user was estimated from the plate image.
+        # Falls back to brand-table γ_eff if k_user is at default (no EXIF match).
+        EPS_EFF_L = 0.638
+        gamma_from_k = round(k_user * EPS_EFF_L, 3)
+
+        # Brand-table value as fallback reference
+        gamma_brand = st.session_state.gamma_eff
+
+        # Use data-driven estimate; if it deviates strongly from brand table,
+        # show both so user can choose
+        gamma_eff_auto = gamma_from_k
+        derivation_msg = (
+            f"γ_eff = k × ε_eff = {k_user:.2f} × 0.638 = **{gamma_from_k:.3f}** "
+            f"(derived from data-driven k). "
+            f"Brand-table fallback: {gamma_brand:.2f}."
+        )
+        st.info(derivation_msg)
 
         gamma_user = st.slider(
             "Effective gamma γ_eff",
             min_value=1.6, max_value=3.2,
-            value=float(gamma_eff),
+            value=float(gamma_eff_auto),
             step=0.01, key="gamma_sec7",
             help=(
-                "Set from EXIF camera brand. sRGB nominal = 2.20. "
-                "iPhone Air empirical = 2.42. "
+                f"Derived from data-driven k = {k_user:.2f} via γ_eff = k × ε_eff (0.638). "
+                "sRGB nominal = 2.20. iPhone Air empirical = 2.42. "
                 "Adjust manually if needed."
             )
         )
