@@ -306,47 +306,14 @@ def export_inverted_excel(gray_df: pd.DataFrame) -> bytes:
 
 def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
                      blank_row_idx: int = 0,
-                     k_override: float = 3.0) -> tuple:
-    """
-    Compute grayscale absorbance with per-column white-point normalisation.
-
-    Model
-    -----
-        A[r, c] = -log10( L_well[r,c] / L_blank[c] ) * k
-
-    where L_blank[c] is the luminance of the blank-row well in column c,
-    NOT the global mean of the entire blank row.
-
-    Rationale
-    ---------
-    Using a single scalar blank (global mean) conflates true absorbance
-    with spatial variation in illumination across the plate: a column-wise
-    gradient from off-centre phone placement, optical vignetting, or uneven
-    LED illumination shifts apparent absorbance up on one side and down on
-    the other.  Per-column normalisation removes this at source because every
-    column references its own measured white point.  This replaces the earlier
-    global-offset approach, which could only remove the *mean* of column-wise
-    offsets while leaving residual column-to-column bias intact.
-
-    Safety guard
-    ------------
-    If a blank well luminance is below 10 % of the plate-wide blank mean
-    (wrong row selected, or anomalously dark well), that column falls back
-    to the plate-wide mean to avoid noise amplification.
-
-    Returns
-    -------
-    (abs_df, col_offsets)
-        abs_df      : 8x12 DataFrame of absorbance values (>= 0)
-        col_offsets : np.ndarray shape (12,) -- per-column luminance deviation
-                      of the blank row in absorbance units; diagnostic for
-                      illumination uniformity shown in the UI.
-    """
+                     k_override: float = 3.0) -> pd.DataFrame:
+    """A = -log10(L_well / L_blank) * k.
+    L_blank = mean luminance of the blank row (scalar).
+    Returns 8x12 DataFrame; wells lighter than blank -> 0."""
     img_gray   = img_orig.convert("L")
     gray_array = np.array(img_gray, dtype=float)
     h, w       = gray_array.shape
 
-    # Pass 1: sample mean luminance for every well
     means = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
@@ -357,35 +324,17 @@ def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
             y1 = min(h, int(y) + SAMPLE_RADIUS + 1)
             means[r, c] = gray_array[y0:y1, x0:x1].mean()
 
-    # Pass 2: per-column white point
-    blank_cols   = means[blank_row_idx, :]       # shape (12,)
-    blank_global = float(blank_cols.mean())      # fallback scalar
-    # Safety guard: suspiciously dark blank wells fall back to global mean
-    blank_ref = np.where(blank_cols > 0.10 * blank_global, blank_cols, blank_global)
+    gray_blank = means[blank_row_idx, :].mean()
 
-    # Pass 3: absorbance with per-column reference
     values = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
-            ref_c = blank_ref[c]
-            gm    = means[r, c]
-            if ref_c > 0 and gm < ref_c:
-                values[r, c] = -math.log10(gm / ref_c) * k_override
+            gm = means[r, c]
+            if gray_blank > 0 and gm < gray_blank:
+                values[r, c] = -math.log10(gm / gray_blank) * k_override
 
-    corrected = np.clip(values, 0.0, None)
-
-    # Diagnostic: per-column offset in absorbance units
-    # (deviation of each blank well from the global blank mean)
-    col_offsets = np.round(
-        -np.log10(np.clip(blank_cols / blank_global, 1e-9, 10.0)) * k_override,
-        4
-    )
-
-    return (
-        pd.DataFrame(np.round(corrected, 4), index=ROWS,
-                     columns=[str(c) for c in COLS]),
-        col_offsets
-    )
+    return pd.DataFrame(np.round(values, 4), index=ROWS,
+                        columns=[str(c) for c in COLS])
 
 
 # MTT formazan extinction coefficient ratio G:R ≈ 6.7 (literature values at
@@ -735,30 +684,10 @@ def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
                                blank_row_idx: int,
                                w_r: float = 0.0, w_g: float = 1.0,
                                w_b: float = 0.0,
-                               gamma: float = 2.2) -> tuple:
-    """
-    Gamma-corrected green-channel absorbance with per-column white-point
-    normalisation.
-
-    Pipeline
-    --------
-        I_G[r,c]  = (G_pixel[r,c] / 255) ^ gamma        -- linearise ISP gamma
-        T_G[r,c]  = I_G[r,c] / I_G_blank[c]             -- per-column transmittance
-        A[r,c]    = -log10( T_G[r,c] )                  -- Beer-Lambert
-
-    I_G_blank[c] is the gamma-linearised green intensity of the blank-row well
-    in column c, not the global blank-row mean.  The same rationale and safety
-    guard as build_absorbance() apply (see that docstring).
-
-    w_r and w_b are accepted for API compatibility but unused.
-
-    Returns
-    -------
-    (abs_df, col_offsets)
-        abs_df      : 8x12 DataFrame of absorbance values (>= 0)
-        col_offsets : np.ndarray shape (12,) -- per-column deviation of the
-                      blank row in absorbance units (illumination diagnostic).
-    """
+                               gamma: float = 2.2) -> pd.DataFrame:
+    """Green channel only: I_G=(G/255)^gamma, T_G=I_G_well/I_G_blank, A=-log10(T_G).
+    I_G_blank = mean of gamma-linearised blank row (scalar).
+    w_r, w_b accepted for API compat but unused. Returns 8x12 DataFrame."""
     arr   = np.array(img_orig.convert("RGB"), dtype=float) / 255.0
     green = np.power(np.clip(arr[:, :, 1], 1e-9, 1.0), gamma)
     h, w  = green.shape
@@ -773,34 +702,17 @@ def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
             y1 = min(h, int(y) + SAMPLE_RADIUS + 1)
             means_g[r, c] = green[y0:y1, x0:x1].mean()
 
-    # Per-column white point (green channel, gamma-linearised)
-    blank_cols_g  = means_g[blank_row_idx, :]       # shape (12,)
-    blank_global_g = float(blank_cols_g.mean())
-    blank_ref_g   = np.where(
-        blank_cols_g > 0.10 * blank_global_g, blank_cols_g, blank_global_g
-    )
+    blank_g = means_g[blank_row_idx, :].mean()
+    values  = np.zeros((N_ROWS, N_COLS), dtype=float)
 
-    values = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
-            ref_c = blank_ref_g[c]
-            T_g   = float(np.clip(means_g[r, c] / ref_c, 1e-9, 1.0)) \
-                    if ref_c > 0 else 1.0
+            T_g = float(np.clip(means_g[r, c] / blank_g, 1e-9, 1.0)) \
+                  if blank_g > 0 else 1.0
             values[r, c] = -math.log10(T_g) if T_g < 1.0 else 0.0
 
-    corrected = np.clip(values, 0.0, None)
-
-    # Diagnostic: per-column blank deviation in absorbance units
-    col_offsets = np.round(
-        -np.log10(np.clip(blank_cols_g / blank_global_g, 1e-9, 10.0)),
-        4
-    )
-
-    return (
-        pd.DataFrame(np.round(corrected, 4), index=ROWS,
-                     columns=[str(c) for c in COLS]),
-        col_offsets
-    )
+    return pd.DataFrame(np.round(values, 4), index=ROWS,
+                        columns=[str(c) for c in COLS])
 
 
 def apply_calibration(raw_df: pd.DataFrame,
@@ -1208,8 +1120,6 @@ def main():
             "law, but smartphone ISP pipelines (tone mapping, JPEG compression) introduce a small "
             "additive bias. This offset is measured from the blank row itself and subtracted "
             "automatically from every well. "
-            "Each well is normalised to its own column's blank well (per-column white point), "
-            "eliminating column-wise illumination gradients and optical vignetting. "
             "The app estimates *k* from the plate image using EXIF-detected camera brand; "
             "adjust manually if needed."
         )
@@ -1260,32 +1170,7 @@ def main():
             )
         )
 
-        abs_df, col_offsets_6 = build_absorbance(img_orig, grid, blank_row_idx, k_user)
-
-        # ── White-point uniformity diagnostic ────────────────────────────────
-        max_dev_6  = float(np.max(np.abs(col_offsets_6)))
-        mean_dev_6 = float(np.mean(np.abs(col_offsets_6)))
-        if max_dev_6 > 0.05:
-            st.warning(
-                f"⚠️ **Illumination non-uniformity detected** across blank row: "
-                f"max column deviation = **{max_dev_6:.4f}** abs. units "
-                f"(mean = {mean_dev_6:.4f}). "
-                f"Per-column white-point normalisation applied — each column uses "
-                f"its own blank well as reference. "
-                f"Column offsets: {np.round(col_offsets_6, 3).tolist()}"
-            )
-        elif max_dev_6 > 0.01:
-            st.info(
-                f"🔧 **Per-column white-point normalisation applied.** "
-                f"Blank-row column deviation: max = {max_dev_6:.4f}, "
-                f"mean = {mean_dev_6:.4f} abs. units — minor illumination "
-                f"gradient corrected automatically."
-            )
-        else:
-            st.caption(
-                f"Illumination uniformity: excellent "
-                f"(max blank-row column deviation = {max_dev_6:.4f} — negligible)."
-            )
+        abs_df = build_absorbance(img_orig, grid, blank_row_idx, k_user)
 
         if has_calibration:
             abs6_final, slope6, intercept6 = apply_calibration(abs_df, cal_wells_shared)
@@ -1295,8 +1180,8 @@ def main():
                 st.markdown(absorbance_table_html(abs6_final), unsafe_allow_html=True)
                 st.caption(
                     f"Calibrated grayscale absorbance. "
-                    f"Formula: **A = −log₁₀(L_well / L_blank_col) × {k_user:.2f}**, then {cal_info_6}. "
-                    f"(per-column white-point; L = 0.299R + 0.587G + 0.114B)"
+                    f"Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f}**, then {cal_info_6}. "
+                    f"(L = 0.299R + 0.587G + 0.114B)"
                 )
                 abs6_xlsx = export_absorbance_excel(abs6_final)
                 st.download_button(
@@ -1319,9 +1204,9 @@ def main():
             st.markdown(absorbance_table_html(abs_df), unsafe_allow_html=True)
             st.caption(
                 f"Uncalibrated. "
-                f"Formula: **A = −log₁₀(L_well / L_blank_col) × {k_user:.2f}** "
-                f"(per-column white-point; L = 0.299R + 0.587G + 0.114B). "
-                "Wells lighter than their column blank are set to 0."
+                f"Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f}** "
+                f"(L = 0.299R + 0.587G + 0.114B). "
+                "Wells lighter than the blank are set to 0."
             )
             abs6_xlsx = export_absorbance_excel(abs_df)
             st.download_button(
@@ -1341,8 +1226,7 @@ def main():
             "γ_eff is derived from the data-driven k estimate (section 6) via "
             "**γ_eff = k × ε_eff** where ε_eff = 0.638 is the luminance-weighted "
             "effective extinction coefficient of MTT formazan under ITU-R BT.601. "
-            "Absorbance is then: **A = −log₁₀(T_G)** where T_G = I_G_well / I_G_blank_col, "
-            "using the blank-row well of each column as reference (per-column white point). "
+            "Absorbance is then: **A = −log₁₀(T_G)** where T_G = I_G_well / I_G_blank. "
             "The green channel is used exclusively because MTT formazan absorbs most strongly "
             "at λ_max ≈ 570 nm, maximising signal-to-noise ratio. "
             "If calibration points are provided above, they are applied automatically."
@@ -1387,31 +1271,9 @@ def main():
         )
 
         w_g, w_r, w_b = 1.0, 0.0, 0.0
-        wabs_df, col_offsets_7 = build_absorbance_weighted(
+        wabs_df = build_absorbance_weighted(
             img_orig, grid, blank_row_idx, w_r, w_g, w_b, gamma=gamma_user
         )
-
-        # ── White-point uniformity diagnostic (green channel) ─────────────────
-        max_dev_7  = float(np.max(np.abs(col_offsets_7)))
-        mean_dev_7 = float(np.mean(np.abs(col_offsets_7)))
-        if max_dev_7 > 0.05:
-            st.warning(
-                f"⚠️ **Green-channel illumination non-uniformity detected:** "
-                f"max column deviation = **{max_dev_7:.4f}** abs. units "
-                f"(mean = {mean_dev_7:.4f}). "
-                f"Per-column white-point normalisation applied (green channel). "
-                f"Column offsets: {np.round(col_offsets_7, 3).tolist()}"
-            )
-        elif max_dev_7 > 0.01:
-            st.info(
-                f"🔧 **Per-column white-point normalisation applied (green channel).** "
-                f"Max column deviation: {max_dev_7:.4f} abs. units."
-            )
-        else:
-            st.caption(
-                f"Green-channel illumination uniformity: excellent "
-                f"(max column deviation = {max_dev_7:.4f})."
-            )
 
         if has_calibration:
             wabs_final, slope7, intercept7 = apply_calibration(wabs_df, cal_wells_shared)
@@ -1422,7 +1284,7 @@ def main():
                             unsafe_allow_html=True)
                 st.caption(
                     f"Calibrated gamma-corrected absorbance. "
-                    f"Formula: **A = −log₁₀(T_G)** with per-column white-point, γ_eff = {gamma_user:.2f}, "
+                    f"Formula: **A = −log₁₀(T_G)** with γ_eff = {gamma_user:.2f}, "
                     f"then {cal_info_7}."
                 )
                 wabs_xlsx = export_weighted_excel(
@@ -1453,8 +1315,9 @@ def main():
             st.markdown(weighted_absorbance_table_html(wabs_df, w_r, w_g, w_b),
                         unsafe_allow_html=True)
             st.caption(
-                f"Uncalibrated. Formula: **A = −log₁₀(T_G)** where T_G = I_G_well / I_G_blank_col "
-                f"(per-column white-point, γ_eff = {gamma_user:.2f}). "
+                f"Uncalibrated. Formula: **A = −log₁₀(T_G)** "
+                f"where T_G = (G_well/255)^{gamma_user:.2f} / (G_blank/255)^{gamma_user:.2f} "
+                f"(γ_eff = {gamma_user:.2f}). "
                 "Enter calibration points above for improved accuracy."
             )
             wabs_xlsx = export_weighted_excel(
