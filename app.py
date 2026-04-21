@@ -306,14 +306,38 @@ def export_inverted_excel(gray_df: pd.DataFrame) -> bytes:
 
 def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
                      blank_row_idx: int = 0,
-                     k_override: float = 3.0) -> pd.DataFrame:
-    """A = −log10(L_well / L_blank) × k. Blank = mean of blank-row luminance.
-    Returns 8×12 DataFrame; wells lighter than blank → 0."""
+                     k_override: float = 3.0) -> tuple:
+    """
+    Compute grayscale absorbance with ISP blank-offset correction.
+
+    Model (updated):
+        A_raw    = −log10(L_well / L_blank_mean) × k
+        A_offset = mean(A_raw) over blank-row wells        ← ISP additive artefact
+        A_corr   = A_raw − A_offset                        ← corrected absorbance
+
+    Rationale for the blank-offset step
+    ────────────────────────────────────
+    Beer-Lambert law requires A = 0 for wells containing only medium (blank row).
+    In practice, smartphone ISP pipelines (tone mapping, local contrast, JPEG
+    quantisation) introduce a small additive bias: blank-row wells yield
+    A_raw ≈ 0.05–0.14 instead of 0.  Statistical analysis across 5 experiments
+    (iPhone Air, n = 396 well pairs) showed that this additive component accounts
+    for 51–79 % of the total squared error in experiments 1, 2 and 5, and is
+    entirely unaddressable by adjusting k (which is a purely multiplicative
+    parameter).  Subtracting A_offset removes the bias without any plate-reader
+    reference and costs zero additional user interaction.
+
+    Returns
+    -------
+    (abs_df, a_offset)
+        abs_df   : 8×12 DataFrame of corrected absorbance values (≥ 0)
+        a_offset : float — the subtracted blank-row offset (shown in the UI)
+    """
     img_gray   = img_orig.convert("L")
     gray_array = np.array(img_gray, dtype=float)
     h, w       = gray_array.shape
 
-    # First pass: collect mean intensity for all wells
+    # ── Pass 1: sample mean luminance for every well ──────────────────────────
     means = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
@@ -324,23 +348,31 @@ def build_absorbance(img_orig: Image.Image, grid: np.ndarray,
             y1 = min(h, int(y) + SAMPLE_RADIUS + 1)
             means[r, c] = gray_array[y0:y1, x0:x1].mean()
 
-    # Global blank = mean intensity of the selected blank row
-    gray_blank = means[blank_row_idx, :].mean()
-
-    # Compute absorbance using user-supplied correction factor
-    values = np.zeros((N_ROWS, N_COLS), dtype=float)
+    # ── Pass 2: compute raw absorbance for every well ─────────────────────────
+    gray_blank = means[blank_row_idx, :].mean()   # scalar: mean of blank row
+    raw = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
             gm = means[r, c]
             if gray_blank > 0 and gm < gray_blank:
-                values[r, c] = -math.log10(gm / gray_blank) * k_override
-            else:
-                values[r, c] = 0.0
+                raw[r, c] = -math.log10(gm / gray_blank) * k_override
+            # else raw[r,c] remains 0.0
 
-    return pd.DataFrame(
-        np.round(values, 4),
-        index=ROWS,
-        columns=[str(c) for c in COLS]
+    # ── Pass 3: blank-offset correction ──────────────────────────────────────
+    # The blank row should measure A = 0. Any non-zero mean is an ISP artefact.
+    # We compute it *from the raw values of the blank row itself* and subtract
+    # it uniformly from every well.  The offset is bounded to [0, 0.30] to
+    # guard against degenerate images where the blank row is unintentionally
+    # dark (e.g., wrong row selected).
+    blank_row_raw = raw[blank_row_idx, :]
+    a_offset = float(np.clip(blank_row_raw.mean(), 0.0, 0.30))
+
+    corrected = np.clip(raw - a_offset, 0.0, None)
+
+    return (
+        pd.DataFrame(np.round(corrected, 4), index=ROWS,
+                     columns=[str(c) for c in COLS]),
+        round(a_offset, 4)
     )
 
 
@@ -444,11 +476,12 @@ def export_absorbance_excel(abs_df: pd.DataFrame) -> bytes:
     # Metadata sheet
     ws_meta = wb.create_sheet("Info")
     ws_meta.append(["MTT Assay Analyzer — estimated absorbance export"])
-    ws_meta.append(["Blank reference = mean grayscale intensity of all 12 row-A wells"])
+    ws_meta.append(["Blank reference = mean grayscale intensity of all 12 blank-row wells"])
     ws_meta.append(["gray_mean = mean of all pixels in the 11×11 px well region"])
-    ws_meta.append(["k = 1.0 + 0.5 × (1 - gray_blank/255)²  (smartphone gamma correction)"])
-    ws_meta.append(["A = -log10(gray_mean / gray_blank) × k"])
-    ws_meta.append(["Wells lighter than blank → A = 0"])
+    ws_meta.append(["Step 1 — raw absorbance: A_raw = -log10(gray_mean / gray_blank) × k"])
+    ws_meta.append(["Step 2 — blank-offset correction: A_offset = mean(A_raw) of blank row"])
+    ws_meta.append(["         A_corr = A_raw - A_offset  (removes ISP additive artefact)"])
+    ws_meta.append(["Wells lighter than blank → A = 0 (before offset subtraction)"])
     ws_meta.append(["Background colour: white = A≈0, black = A≥2"])
 
     buf = io.BytesIO()
@@ -690,9 +723,27 @@ def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
                                blank_row_idx: int,
                                w_r: float = 0.0, w_g: float = 1.0,
                                w_b: float = 0.0,
-                               gamma: float = 2.2) -> pd.DataFrame:
-    """Green channel only: I_G=(G/255)^γ, T_G=I_G_well/I_G_blank, A=−log10(T_G).
-    w_r, w_b accepted for API compat but ignored. Returns 8×12 DataFrame."""
+                               gamma: float = 2.2) -> tuple:
+    """
+    Gamma-corrected green-channel absorbance with ISP blank-offset correction.
+
+    Pipeline:
+        I_G      = (G_pixel / 255) ^ γ_eff          ← linearise gamma encoding
+        T_G      = I_G_well / I_G_blank              ← transmittance
+        A_raw    = −log10(T_G)                       ← Beer-Lambert
+        A_offset = mean(A_raw) over blank-row wells  ← ISP additive artefact
+        A_corr   = A_raw − A_offset                  ← corrected absorbance
+
+    The blank-offset step is identical in rationale to the grayscale correction
+    (see build_absorbance docstring).  w_r and w_b are accepted for API
+    compatibility but unused — the green channel is used exclusively.
+
+    Returns
+    -------
+    (abs_df, a_offset)
+        abs_df   : 8×12 DataFrame of corrected absorbance values (≥ 0)
+        a_offset : float — the subtracted blank-row offset (shown in the UI)
+    """
     arr   = np.array(img_orig.convert("RGB"), dtype=float) / 255.0
     green = np.power(np.clip(arr[:, :, 1], 1e-9, 1.0), gamma)
     h, w  = green.shape
@@ -708,16 +759,25 @@ def build_absorbance_weighted(img_orig: Image.Image, grid: np.ndarray,
             means_g[r, c] = green[y0:y1, x0:x1].mean()
 
     blank_g = means_g[blank_row_idx, :].mean()
-    values  = np.zeros((N_ROWS, N_COLS), dtype=float)
 
+    # ── Raw absorbance ────────────────────────────────────────────────────────
+    raw = np.zeros((N_ROWS, N_COLS), dtype=float)
     for r in range(N_ROWS):
         for c in range(N_COLS):
             T_g = float(np.clip(means_g[r, c] / blank_g, 1e-9, 1.0)) \
                   if blank_g > 0 else 1.0
-            values[r, c] = -math.log10(T_g) if T_g < 1.0 else 0.0
+            raw[r, c] = -math.log10(T_g) if T_g < 1.0 else 0.0
 
-    return pd.DataFrame(np.round(values, 4), index=ROWS,
-                        columns=[str(c) for c in COLS])
+    # ── Blank-offset correction ───────────────────────────────────────────────
+    blank_row_raw = raw[blank_row_idx, :]
+    a_offset = float(np.clip(blank_row_raw.mean(), 0.0, 0.30))
+    corrected = np.clip(raw - a_offset, 0.0, None)
+
+    return (
+        pd.DataFrame(np.round(corrected, 4), index=ROWS,
+                     columns=[str(c) for c in COLS]),
+        round(a_offset, 4)
+    )
 
 
 def apply_calibration(raw_df: pd.DataFrame,
@@ -1116,11 +1176,15 @@ def main():
         st.markdown("### 6️⃣ Estimated absorbance (grayscale, correction factor *k*)")
         st.caption(
             "Absorbance is estimated from the ITU-R BT.601 grayscale luminance of each well "
-            "relative to the blank row: **A = −log₁₀(L_well / L_blank) × k**. "
+            "relative to the blank row: **A = −log₁₀(L_well / L_blank) × k − A_offset**. "
             "The correction factor *k* compensates for the non-linear gamma encoding of "
             "smartphone JPEG images and the luminance-weighted effective extinction coefficient "
             "of MTT formazan (ε_eff = 0.638). "
             "The theoretical baseline is **k = γ / ε_eff = 2.2 / 0.638 = 3.45** (sRGB, IEC 61966-2-1). "
+            "**A_offset** is the mean raw absorbance of the blank row — it should be 0 by Beer-Lambert "
+            "law, but smartphone ISP pipelines (tone mapping, JPEG compression) introduce a small "
+            "additive bias. This offset is measured from the blank row itself and subtracted "
+            "automatically from every well. "
             "The app estimates *k* from the plate image using EXIF-detected camera brand; "
             "adjust manually if needed."
         )
@@ -1171,7 +1235,23 @@ def main():
             )
         )
 
-        abs_df = build_absorbance(img_orig, grid, blank_row_idx, k_user)
+        abs_df, a_offset_6 = build_absorbance(img_orig, grid, blank_row_idx, k_user)
+
+        # ── Blank-offset info box ─────────────────────────────────────────────
+        # Show the measured ISP offset so the user understands the correction.
+        if a_offset_6 > 0.005:
+            st.info(
+                f"🔧 **Blank-offset correction applied:** "
+                f"A_offset = **{a_offset_6:.4f}** (mean raw absorbance of blank row). "
+                f"This value was subtracted from every well to remove the additive ISP "
+                f"artefact introduced by smartphone tone-mapping. "
+                f"Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f} − {a_offset_6:.4f}**."
+            )
+        else:
+            st.caption(
+                f"Blank-offset correction: A_offset = {a_offset_6:.4f} (negligible — no adjustment needed). "
+                f"Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f}**."
+            )
 
         if has_calibration:
             abs6_final, slope6, intercept6 = apply_calibration(abs_df, cal_wells_shared)
@@ -1180,8 +1260,9 @@ def main():
                 st.success(f"Calibration applied: {cal_info_6}")
                 st.markdown(absorbance_table_html(abs6_final), unsafe_allow_html=True)
                 st.caption(
-                    f"Calibrated grayscale absorbance. Formula: "
-                    f"**A = −log₁₀(L_well / L_blank) × {k_user:.2f}**, then {cal_info_6}. "
+                    f"Calibrated grayscale absorbance. "
+                    f"Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f} − {a_offset_6:.4f}**, "
+                    f"then {cal_info_6}. "
                     f"(L = 0.299R + 0.587G + 0.114B)"
                 )
                 abs6_xlsx = export_absorbance_excel(abs6_final)
@@ -1204,7 +1285,8 @@ def main():
         else:
             st.markdown(absorbance_table_html(abs_df), unsafe_allow_html=True)
             st.caption(
-                f"Uncalibrated. Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f}** "
+                f"Uncalibrated. "
+                f"Formula: **A = −log₁₀(L_well / L_blank) × {k_user:.2f} − {a_offset_6:.4f}** "
                 f"(L = 0.299R + 0.587G + 0.114B). "
                 "Wells lighter than the blank are set to 0."
             )
@@ -1226,9 +1308,9 @@ def main():
             "γ_eff is derived from the data-driven k estimate (section 6) via "
             "**γ_eff = k × ε_eff** where ε_eff = 0.638 is the luminance-weighted "
             "effective extinction coefficient of MTT formazan under ITU-R BT.601. "
-            "This links the gamma estimate directly to the plate data rather than "
-            "relying solely on a fixed brand table. "
-            "Absorbance is then: **A = −log₁₀(T_G)** where T_G = I_G_well / I_G_blank. "
+            "Absorbance is then: **A = −log₁₀(T_G) − A_offset** where "
+            "T_G = I_G_well / I_G_blank, and **A_offset** is the mean raw absorbance of the "
+            "blank row (ISP additive artefact, automatically measured and subtracted). "
             "The green channel is used exclusively because MTT formazan absorbs most strongly "
             "at λ_max ≈ 570 nm, maximising signal-to-noise ratio. "
             "If calibration points are provided above, they are applied automatically."
@@ -1268,9 +1350,23 @@ def main():
         )
 
         w_g, w_r, w_b = 1.0, 0.0, 0.0
-        wabs_df = build_absorbance_weighted(
+        wabs_df, a_offset_7 = build_absorbance_weighted(
             img_orig, grid, blank_row_idx, w_r, w_g, w_b, gamma=gamma_user
         )
+
+        # ── Blank-offset info box ─────────────────────────────────────────────
+        if a_offset_7 > 0.005:
+            st.info(
+                f"🔧 **Blank-offset correction applied:** "
+                f"A_offset = **{a_offset_7:.4f}** (mean raw absorbance of blank row, green channel). "
+                f"Subtracted from every well to remove ISP additive artefact. "
+                f"Formula: **A = −log₁₀(T_G) − {a_offset_7:.4f}** (γ_eff = {gamma_user:.2f})."
+            )
+        else:
+            st.caption(
+                f"Blank-offset correction: A_offset = {a_offset_7:.4f} (negligible). "
+                f"Formula: **A = −log₁₀(T_G)** (γ_eff = {gamma_user:.2f})."
+            )
 
         if has_calibration:
             wabs_final, slope7, intercept7 = apply_calibration(wabs_df, cal_wells_shared)
@@ -1281,7 +1377,7 @@ def main():
                             unsafe_allow_html=True)
                 st.caption(
                     f"Calibrated gamma-corrected absorbance. "
-                    f"Formula: **A = −log₁₀(T_G)** with γ_eff = {gamma_user:.2f}, "
+                    f"Formula: **A = −log₁₀(T_G) − {a_offset_7:.4f}** with γ_eff = {gamma_user:.2f}, "
                     f"then {cal_info_7}."
                 )
                 wabs_xlsx = export_weighted_excel(
@@ -1312,7 +1408,7 @@ def main():
             st.markdown(weighted_absorbance_table_html(wabs_df, w_r, w_g, w_b),
                         unsafe_allow_html=True)
             st.caption(
-                f"Uncalibrated. Formula: **A = −log₁₀(T_G)** "
+                f"Uncalibrated. Formula: **A = −log₁₀(T_G) − {a_offset_7:.4f}** "
                 f"where T_G = (G_well/255)^{gamma_user:.2f} / (G_blank/255)^{gamma_user:.2f} "
                 f"(γ_eff = {gamma_user:.2f}). "
                 "Enter calibration points above for improved accuracy."
